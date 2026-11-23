@@ -1701,6 +1701,7 @@ impl Blockstore {
         let mut start = Measure::start("Shred insertion");
         for (shred, is_repaired, location) in shreds {
             let slot = shred.slot();
+            let index = shred.index();
             let shred_source = if is_repaired {
                 ShredSource::Repaired
             } else {
@@ -1740,6 +1741,7 @@ impl Blockstore {
                                 metrics.num_repair += 1;
                             }
                             metrics.num_inserted += 1;
+                            solana_runtime::shred_to_tx_timing::shred_inserted(slot, index, true);
                         }
                     };
                 }
@@ -1780,6 +1782,7 @@ impl Blockstore {
                         Ok(()) => {
                             metrics.num_coding_shreds_inserted += 1;
                             metrics.num_inserted += 1;
+                            solana_runtime::shred_to_tx_timing::shred_inserted(slot, index, false);
                         }
                     }
                 }
@@ -1873,6 +1876,8 @@ impl Blockstore {
         metrics.num_recovered += recovered_data_shreds.len();
         for shred in recovered_data_shreds {
             let slot = shred.slot();
+            let index = shred.index();
+            let fec_set_index = shred.fec_set_index();
             *match self.check_insert_data_shred(
                 Cow::Owned(shred),
                 BlockLocation::Original,
@@ -1894,7 +1899,10 @@ impl Blockstore {
                     error!("blockstore error: {err}");
                     &mut metrics.num_recovered_blockstore_error
                 }
-                Ok(()) => &mut metrics.num_recovered_inserted,
+                Ok(()) => {
+                    solana_runtime::shred_to_tx_timing::recovered(slot, index, fec_set_index);
+                    &mut metrics.num_recovered_inserted
+                }
             } += 1;
         }
         start.stop();
@@ -2316,6 +2324,7 @@ impl Blockstore {
         metrics: &mut BlockstoreInsertionMetrics,
     ) -> Result<InsertResults> {
         let insert_start = solana_runtime::slot_tail_timing::now_if_enabled();
+        let shred_to_tx_insert_start = solana_runtime::shred_to_tx_timing::now_if_enabled();
         let shreds = shreds.into_iter();
         let mut shred_insertion_tracker = ShredInsertionTracker::new(shreds.len(), write_batch);
 
@@ -2359,6 +2368,26 @@ impl Blockstore {
         self.write_batch(&mut *shred_insertion_tracker.write_batch)?;
         start.stop();
         metrics.write_batch_elapsed_us += start.as_us();
+        if shred_to_tx_insert_start != 0 {
+            let insert_done = solana_runtime::shred_to_tx_timing::now();
+            for set in &shred_insertion_tracker.newly_completed_data_sets {
+                solana_runtime::shred_to_tx_timing::data_set_completed(
+                    set.slot,
+                    set.indices.clone(),
+                    shred_to_tx_insert_start,
+                    insert_done,
+                );
+            }
+            for ((location, slot), entry) in &shred_insertion_tracker.slot_meta_working_set {
+                if matches!(location, BlockLocation::Original) && entry.did_insert_occur {
+                    solana_runtime::shred_to_tx_timing::consumed(
+                        *slot,
+                        entry.new_slot_meta.borrow().consumed,
+                        insert_done,
+                    );
+                }
+            }
+        }
         for (slot, _) in newly_completed_slots_with_last_index.iter() {
             solana_runtime::slot_tail_timing::full(*slot, insert_start);
         }

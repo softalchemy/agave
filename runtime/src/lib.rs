@@ -30,6 +30,7 @@ pub mod rent_collector;
 mod reward_info;
 pub mod runtime_config;
 pub mod serde_snapshot;
+pub mod shred_to_tx_timing;
 pub mod slot_params;
 pub mod slot_tail_timing;
 pub mod snapshot_bank_utils;

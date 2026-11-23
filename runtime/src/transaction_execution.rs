@@ -94,6 +94,7 @@ pub fn execute_batch<'a>(
             pre_commit_callback,
         )?;
     slot_tail_timing::tx_committed(bank.slot());
+    crate::shred_to_tx_timing::committed(bank.slot(), &transaction_indexes);
 
     let mut check_block_costs_elapsed = Measure::start("check_block_costs");
 

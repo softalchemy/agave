@@ -168,6 +168,7 @@ fn run_shred_sigverify<const K: usize>(
     }
 
     let now = Instant::now();
+    let sigverify_start = solana_runtime::shred_to_tx_timing::now_if_enabled();
     stats.num_iters += 1;
     stats.num_batches += shred_buffer.len();
     stats.num_discards_pre += count_discards(shred_buffer);
@@ -270,6 +271,22 @@ fn run_shred_sigverify<const K: usize>(
                 stats.num_retransmit_stage_overflow_shreds += v.len();
             }
             _ => unreachable!("EvictingSender holds on to both ends of the channel"),
+        }
+    }
+    if sigverify_start != 0 {
+        let sigverify_done = solana_runtime::shred_to_tx_timing::now();
+        for packet in shred_buffer
+            .iter()
+            .flat_map(|batch| batch.iter())
+            .filter(|packet| !packet.meta().discard())
+        {
+            if let Some(data) = packet.data(..) {
+                solana_ledger::shred_to_tx_timing::packet_sigverified(
+                    data,
+                    sigverify_start,
+                    sigverify_done,
+                );
+            }
         }
     }
     // Send all shreds to window service to be inserted into blockstore.

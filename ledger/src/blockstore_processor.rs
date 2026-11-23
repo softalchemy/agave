@@ -50,6 +50,7 @@ use {
         leader_schedule_utils::leader_slot_index,
         qn_flags,
         runtime_config::RuntimeConfig,
+        shred_to_tx_timing,
         slot_tail_timing::{self, Event},
         snapshot_controller::SnapshotController,
         transaction_execution::TransactionStatusSender,
@@ -243,6 +244,7 @@ fn process_entries(bank: &BankWithScheduler, entries: Vec<ReplayEntry>) -> Resul
     }
     if has_entries {
         slot_tail_timing::mark(bank.slot(), Event::LastEntryScheduled);
+        shred_to_tx_timing::scheduled(bank.slot());
     }
     for hash in tick_hashes {
         bank.register_tick(&hash);
@@ -1536,6 +1538,7 @@ fn confirm_slot_once(
         load_result
     }?;
     slot_tail_timing::mark(slot, Event::EntriesFetched);
+    shred_to_tx_timing::fetched(slot, &completed_ranges);
 
     // Process block components for Alpenglow slots. Note that we don't need to run migration checks
     // for BlockMarkers here, despite BlockMarkers only being active post-Alpenglow. Here's why:
@@ -1594,6 +1597,14 @@ fn confirm_slot_once(
                         })?;
                 }
 
+                if qn_flags::shred_to_tx_timing() {
+                    shred_to_tx_timing::entry_batch(
+                        slot,
+                        completed_range.end,
+                        progress.num_txs,
+                        entries.iter().map(|entry| entry.transactions.len()).sum(),
+                    );
+                }
                 confirm_slot_entries(
                     bank,
                     replay_verification_worker_pool,
@@ -1802,6 +1813,7 @@ fn confirm_slot_entries(
         replay_timer.stop();
         *replay_elapsed += replay_timer.as_us();
         slot_tail_timing::mark(slot, Event::LastEntryScheduled);
+        shred_to_tx_timing::scheduled(slot);
         (vec![], Some(scheduled?))
     } else {
         (entries, None)

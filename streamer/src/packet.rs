@@ -14,9 +14,15 @@ use {
     std::{
         io::{ErrorKind, Result},
         net::UdpSocket,
+        sync::OnceLock,
         time::{Duration, Instant},
     },
 };
+
+pub type PacketRecvHook = Box<dyn Fn(&BytesPacketBatch, usize)>;
+
+pub static PACKET_RECV_HOOK_FACTORY: OnceLock<fn(&str) -> Option<PacketRecvHook>> =
+    OnceLock::new();
 pub use {
     solana_packet::{Meta, PACKET_DATA_SIZE, Packet},
     solana_perf::packet::{
@@ -42,6 +48,7 @@ pub(crate) fn recv_from(
     //   * There are no more data available to read from the socket.
     max_wait: Option<Duration>,
     pool: &mut PacketBufferPool,
+    hook: Option<&dyn Fn(&BytesPacketBatch, usize)>,
 ) -> Result<usize> {
     batch.clear();
     //DOCUMENTED SIDE-EFFECT
@@ -71,6 +78,11 @@ pub(crate) fn recv_from(
                 if batch.len() == npkts {
                     socket.set_nonblocking(true)?;
                 }
+                if let Some(hook) = hook
+                    && npkts > 0
+                {
+                    hook(batch, batch.len() - npkts);
+                }
                 trace!("got {npkts} packets");
                 // Try to batch into big enough buffers
                 // will cause less re-shuffling later on.
@@ -98,6 +110,7 @@ pub(crate) fn recv_from(
     max_wait: Option<Duration>,
     poll_fd: &mut [PollFd],
     pool: &mut PacketBufferPool,
+    hook: Option<&dyn Fn(&BytesPacketBatch, usize)>,
 ) -> Result<usize> {
     use crate::streamer::SOCKET_READ_TIMEOUT;
 
@@ -138,12 +151,18 @@ pub(crate) fn recv_from(
         socket: &UdpSocket,
         poll_fd: &mut [PollFd],
         pool: &mut PacketBufferPool,
+        hook: Option<&dyn Fn(&BytesPacketBatch, usize)>,
     ) -> Result<usize> {
         let mut did_poll = false;
 
         loop {
             match recv_mmsg(socket, batch, pool) {
-                Ok(_) => {
+                Ok(npkts) => {
+                    if let Some(hook) = hook
+                        && npkts > 0
+                    {
+                        hook(batch, batch.len() - npkts);
+                    }
                     if batch.len() >= PACKETS_PER_BATCH {
                         break;
                     }
@@ -183,6 +202,7 @@ pub(crate) fn recv_from(
         max_wait: Duration,
         poll_fd: &mut [PollFd],
         pool: &mut PacketBufferPool,
+        hook: Option<&dyn Fn(&BytesPacketBatch, usize)>,
     ) -> Result<usize> {
         #[cfg(any(
             target_os = "linux",
@@ -205,7 +225,12 @@ pub(crate) fn recv_from(
 
         loop {
             match recv_mmsg(socket, batch, pool) {
-                Ok(_) => {
+                Ok(npkts) => {
+                    if let Some(hook) = hook
+                        && npkts > 0
+                    {
+                        hook(batch, batch.len() - npkts);
+                    }
                     if batch.len() >= PACKETS_PER_BATCH {
                         break;
                     }
@@ -271,8 +296,8 @@ pub(crate) fn recv_from(
 
     batch.clear();
     let i = match max_wait {
-        Some(max_wait) => recv_from_coalesce(batch, socket, max_wait, poll_fd, pool),
-        None => recv_from_once(batch, socket, poll_fd, pool),
+        Some(max_wait) => recv_from_coalesce(batch, socket, max_wait, poll_fd, pool, hook),
+        None => recv_from_once(batch, socket, poll_fd, pool, hook),
     }?;
 
     Ok(i)
@@ -330,11 +355,12 @@ mod tests {
                 max_wait,
                 &mut poll_fd,
                 &mut PacketBufferPool::new(),
+                None,
             )
         }
         #[cfg(not(unix))]
         {
-            recv_from_impl(batch, socket, max_wait, &mut PacketBufferPool::new())
+            recv_from_impl(batch, socket, max_wait, &mut PacketBufferPool::new(), None)
         }
     }
 

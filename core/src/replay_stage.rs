@@ -979,6 +979,7 @@ impl ReplayStage {
                     break;
                 }
                 slot_tail_timing::replay_pass();
+                solana_runtime::shred_to_tx_timing::replay_pass();
 
                 if matches!(
                     Self::process_bank_forks_commands(
@@ -4160,6 +4161,7 @@ impl ReplayStage {
                     Ok(())
                 };
                 slot_tail_timing::mark(bank_slot, Event::FreezeDone);
+                solana_runtime::shred_to_tx_timing::frozen(bank_slot);
 
                 datapoint_info!(
                     "bank_frozen",

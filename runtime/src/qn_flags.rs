@@ -39,6 +39,8 @@ static GEYSER_PROCESSED_EARLY: LazyLock<bool> = LazyLock::new(|| {
 static REPLAY_SCHEDULE_PER_ENTRY: LazyLock<bool> =
     LazyLock::new(|| enabled("AGAVE_REPLAY_SCHEDULE_PER_ENTRY"));
 static SLOT_TAIL_TIMING: LazyLock<bool> = LazyLock::new(|| enabled("AGAVE_SLOT_TAIL_TIMING"));
+static SHRED_TO_TX_TIMING: LazyLock<bool> =
+    LazyLock::new(|| enabled("AGAVE_SHRED_TO_TX_TIMING"));
 static FOOTER_CERT_VERIFY_PARALLEL: LazyLock<bool> =
     LazyLock::new(|| enabled("AGAVE_FOOTER_CERT_VERIFY_PARALLEL"));
 
@@ -176,6 +178,10 @@ pub fn slot_tail_timing() -> bool {
     *SLOT_TAIL_TIMING
 }
 
+pub fn shred_to_tx_timing() -> bool {
+    *SHRED_TO_TX_TIMING
+}
+
 pub fn log_flags() {
     if footer_cert_verify_parallel()
         || footer_rewards_overlap()
@@ -207,12 +213,13 @@ pub fn log_flags() {
     info!(
         "qn flags: geyser_tx_notify_inline={} geyser_processed_inline={} \
          geyser_processed_early={} replay_schedule_per_entry={} slot_tail_timing={} \
-         footer_cert_verify_parallel={}",
+         footer_cert_verify_parallel={} shred_to_tx_timing={}",
         geyser_tx_notify_inline(),
         geyser_processed_inline(),
         geyser_processed_early(),
         replay_schedule_per_entry(),
         slot_tail_timing(),
         footer_cert_verify_parallel(),
+        shred_to_tx_timing(),
     );
 }

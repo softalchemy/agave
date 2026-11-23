@@ -25,6 +25,7 @@ pub mod leader_schedule_cache;
 pub mod next_slots_iterator;
 pub mod rooted_slot_iterator;
 pub mod shred;
+pub mod shred_to_tx_timing;
 mod shredder;
 pub mod sigverify_shreds;
 pub mod slot_stats;
