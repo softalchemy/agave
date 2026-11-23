@@ -78,6 +78,7 @@ pub fn execute_batch<'a>(
     } = batch;
 
     let transaction_indexes = Cow::from(transaction_indexes);
+    crate::tx_exec_timing::exec_start(bank.slot(), &transaction_indexes);
 
     let pre_commit_callback = |processing_results: &_| -> TransactionResult<()> {
         // We're entering into one of the block-verification methods.
@@ -95,6 +96,7 @@ pub fn execute_batch<'a>(
         )?;
     slot_tail_timing::tx_committed(bank.slot());
     crate::shred_to_tx_timing::committed(bank.slot(), &transaction_indexes);
+    crate::tx_exec_timing::committed(bank.slot(), &transaction_indexes);
 
     let mut check_block_costs_elapsed = Measure::start("check_block_costs");
 

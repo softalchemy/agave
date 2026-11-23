@@ -56,6 +56,7 @@ pub mod test_utils;
 pub mod transaction_balances;
 pub mod transaction_batch;
 pub mod transaction_execution;
+pub mod tx_exec_timing;
 pub mod validated_block_finalization;
 pub mod validated_reward_certificate;
 pub mod vote_sender_types;

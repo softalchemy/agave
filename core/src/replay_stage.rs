@@ -4162,6 +4162,7 @@ impl ReplayStage {
                 };
                 slot_tail_timing::mark(bank_slot, Event::FreezeDone);
                 solana_runtime::shred_to_tx_timing::frozen(bank_slot);
+                solana_runtime::tx_exec_timing::frozen(bank_slot);
 
                 datapoint_info!(
                     "bank_frozen",

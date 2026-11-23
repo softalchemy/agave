@@ -4858,6 +4858,7 @@ impl Bank {
         } else {
             Self::cancelled_load_and_execute_tx_batch(batch)
         };
+        crate::tx_exec_timing::executed();
 
         if let Some(pre_commit_callback) = pre_commit_callback {
             let () = pre_commit_callback(&processing_results)?;
@@ -5869,6 +5870,7 @@ impl Bank {
         // WARNING: Any pending features added here most likely must also be checked in
         //          `Bank::resanitize_transaction_minimally`.
         let mut sanitized_tx = {
+            let timing_start = crate::tx_exec_timing::split_start();
             let size = tx.data().len();
             if size > max_transaction_size {
                 return Err(TransactionError::SanitizeFailure);
@@ -5896,14 +5898,24 @@ impl Bank {
                 MessageHash::Compute,
                 None,
             )?;
+            let timing_sanitized = crate::tx_exec_timing::split_add(
+                crate::tx_exec_timing::Step::TxSanitizeHash,
+                timing_start,
+            );
 
             let (loaded_addresses, _) = self.load_addresses_for_view(&sanitized_tx)?;
+            let timing_loaded = crate::tx_exec_timing::split_add(
+                crate::tx_exec_timing::Step::TxAlt,
+                timing_sanitized,
+            );
 
-            RuntimeTransaction::<ResolvedTransactionView<_>>::try_new(
+            let resolved_tx = RuntimeTransaction::<ResolvedTransactionView<_>>::try_new(
                 sanitized_tx,
                 loaded_addresses,
                 self.get_reserved_account_keys(),
-            )
+            );
+            crate::tx_exec_timing::split_add(crate::tx_exec_timing::Step::TxResolve, timing_loaded);
+            resolved_tx
         }?;
 
         if !self.feature_set.snapshot().loaderv3_programdata_size_floor {

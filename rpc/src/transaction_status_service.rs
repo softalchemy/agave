@@ -293,6 +293,7 @@ impl TransactionStatusService {
                         );
                         slot_tail_timing::mark_max(slot, Event::LastTxGeyserNotified);
                         solana_runtime::shred_to_tx_timing::notified(slot, transaction_index);
+                        solana_runtime::tx_exec_timing::notified(slot, transaction_index);
                     }
 
                     if !(enable_extended_tx_metadata_storage || transaction_notifier.is_some()) {

@@ -824,6 +824,7 @@ impl Validator {
         info!("vote account pubkey: {vote_account}");
         solana_runtime::qn_flags::log_flags();
         solana_runtime::shred_to_tx_timing::start();
+        solana_runtime::tx_exec_timing::start();
 
         if !config.no_os_network_stats_reporting {
             verify_net_stats_access().map_err(|e| {

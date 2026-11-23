@@ -38,6 +38,7 @@ use {
         transaction_execution::{
             TransactionBatchWithIndexes, TransactionStatusSender, execute_batch,
         },
+        tx_exec_timing::{self, SchedulerThreadTiming, Step},
         vote_sender_types::{ReplayVoteSendType, ReplayVoteSender},
     },
     solana_runtime_transaction::runtime_transaction::ReplayTransaction,
@@ -1377,6 +1378,7 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                         Self::max_unique_active_task_count(),
                     )
                 };
+                let mut timing = SchedulerThreadTiming::new();
 
                 // The following loop maintains and updates ResultWithTimings as its
                 // externally-provided mutable state for each session in this way:
@@ -1409,7 +1411,17 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                                 let Ok(executed_task) = handler_result else {
                                     break 'nonaborted_main_loop;
                                 };
+                                let unblocked_before = state_machine.unblocked_task_queue_count();
                                 state_machine.deschedule_task(&executed_task.task);
+                                if timing.on {
+                                    timing.descheduled(
+                                        current_slot,
+                                        executed_task.task.task_id() as usize,
+                                        state_machine
+                                            .unblocked_task_queue_count()
+                                            .saturating_sub(unblocked_before),
+                                    );
+                                }
 
                                 if Self::abort_or_accumulate_result_with_timings(
                                     &mut result_with_timings,
@@ -1424,6 +1436,9 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                                 let task = state_machine
                                     .schedule_next_unblocked_task()
                                     .expect("unblocked task");
+                                if timing.on {
+                                    timing.dispatched(current_slot, task.task_id() as usize);
+                                }
                                 runnable_task_sender.send_payload(task).unwrap();
                             },
                             recv(new_task_receiver) -> message => {
@@ -1435,8 +1450,14 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                                         sleepless_testing::at(CheckPoint::NewTask(task_id));
 
                                         if let Some(task) = state_machine.schedule_or_buffer_task(task, session_ending) {
+                                            if timing.on {
+                                                timing.received(current_slot, task_id as usize, false);
+                                            }
                                             runnable_task_sender.send_aux_payload(task).unwrap();
                                         } else {
+                                            if timing.on {
+                                                timing.received(current_slot, task_id as usize, true);
+                                            }
                                             sleepless_testing::at(CheckPoint::BufferedOrDroppedTask(task_id));
                                         }
                                     }
@@ -1463,7 +1484,17 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                                 let Ok(executed_task) = handler_result else {
                                     break 'nonaborted_main_loop;
                                 };
+                                let unblocked_before = state_machine.unblocked_task_queue_count();
                                 state_machine.deschedule_task(&executed_task.task);
+                                if timing.on {
+                                    timing.descheduled(
+                                        current_slot,
+                                        executed_task.task.task_id() as usize,
+                                        state_machine
+                                            .unblocked_task_queue_count()
+                                            .saturating_sub(unblocked_before),
+                                    );
+                                }
 
                                 if Self::abort_or_accumulate_result_with_timings(
                                     &mut result_with_timings,
@@ -1486,6 +1517,7 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                         .expect("always outlived receiver");
 
                     state_machine.reinitialize();
+                    timing.reset();
                     assert!(mem::replace(&mut session_ending, false));
 
                     // This variable is hoisted from OpenSubchannel match arm to pass the rustc
@@ -1583,6 +1615,7 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
             let mut runnable_task_receiver = runnable_task_receiver.clone();
             let finished_blocked_task_sender = finished_blocked_task_sender.clone();
             let finished_idle_task_sender = finished_idle_task_sender.clone();
+            let handler_timing = tx_exec_timing::enabled();
 
             // The following loop maintains and updates SchedulingContext as its
             // externally-provided state for each session in this way:
@@ -1639,6 +1672,15 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                             }
                         }
                     };
+                    let timed_task = handler_timing.then(|| {
+                        (
+                            runnable_task_receiver.context().slot(),
+                            task.task_id() as usize,
+                        )
+                    });
+                    if let Some((slot, index)) = timed_task {
+                        tx_exec_timing::picked_up(slot, index, thread_index);
+                    }
                     defer! {
                         if !thread::panicking() {
                             return;
@@ -1662,6 +1704,9 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                         &mut task,
                         &handler_context,
                     );
+                    if let Some((slot, index)) = timed_task {
+                        tx_exec_timing::handler_done(slot, index);
+                    }
                     if sender.send(Ok(task)).is_err() {
                         warn!("handler_thread: scheduler thread aborted...");
                         break;
@@ -1938,10 +1983,15 @@ impl<TH: TaskHandler> InstalledScheduler for PooledScheduler<TH> {
         transaction: ReplayTransaction,
         task_id: OrderedTaskId,
     ) -> ScheduleResult {
+        let timing_start = tx_exec_timing::split_start();
         let task = SchedulingStateMachine::create_task(transaction, task_id, &mut |pubkey| {
             self.inner.usage_queue_loader.load(pubkey)
         });
-        self.inner.thread_manager.send_task(task)
+        let timing_created = tx_exec_timing::split_add(Step::CreateTask, timing_start);
+        tx_exec_timing::scheduled(self.context.slot(), task_id as usize);
+        let result = self.inner.thread_manager.send_task(task);
+        tx_exec_timing::split_add(Step::Send, timing_created);
+        result
     }
 
     fn recover_error_after_abort(&mut self) -> TransactionError {

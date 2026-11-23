@@ -54,6 +54,7 @@ use {
         slot_tail_timing::{self, Event},
         snapshot_controller::SnapshotController,
         transaction_execution::TransactionStatusSender,
+        tx_exec_timing::{self, Step},
         vote_sender_types::{ReplayVoteMessage, ReplayVoteSender},
     },
     solana_runtime_transaction::runtime_transaction::ReplayTransaction,
@@ -229,10 +230,12 @@ fn process_entries(bank: &BankWithScheduler, entries: Vec<ReplayEntry>) -> Resul
                     "no scheduler installed for bank of slot {} during replay",
                     bank.slot()
                 );
+                let timing_start = tx_exec_timing::split_start();
                 validate_entry_transactions(
                     &transactions,
                     bank.get_transaction_account_lock_limit(),
                 )?;
+                tx_exec_timing::split_add(Step::LockValidate, timing_start);
 
                 let indexes = starting_index..starting_index + transactions.len();
                 // Widening usize index to OrderedTaskId (= u128) won't ever fail.
@@ -245,6 +248,7 @@ fn process_entries(bank: &BankWithScheduler, entries: Vec<ReplayEntry>) -> Resul
     if has_entries {
         slot_tail_timing::mark(bank.slot(), Event::LastEntryScheduled);
         shred_to_tx_timing::scheduled(bank.slot());
+        tx_exec_timing::set_end(bank.slot());
     }
     for hash in tick_hashes {
         bank.register_tick(&hash);
@@ -267,6 +271,7 @@ where
     let mut tick_hashes = vec![];
     let mut at_block_boundary = false;
     for (entry, &starting_index) in entries.into_iter().zip(entry_tx_starting_indexes) {
+        let timing_start = tx_exec_timing::split_start();
         let entry =
             entry::validate_and_hash_entry_transactions(entry, verify, &mut unverified_signatures)
                 .inspect_err(|_| {
@@ -275,6 +280,7 @@ where
                         bank.slot()
                     );
                 })?;
+        tx_exec_timing::split_add(Step::TxVerify, timing_start);
         match entry {
             EntryType::Tick(hash) => {
                 if !at_block_boundary {
@@ -301,10 +307,12 @@ where
                     "no scheduler installed for bank of slot {} during replay",
                     bank.slot()
                 );
+                let timing_start = tx_exec_timing::split_start();
                 validate_entry_transactions(
                     &transactions,
                     bank.get_transaction_account_lock_limit(),
                 )?;
+                tx_exec_timing::split_add(Step::LockValidate, timing_start);
                 let indexes = starting_index..starting_index + transactions.len();
                 let task_ids = indexes.map(|i| i.try_into().unwrap());
                 bank.schedule_transaction_executions(transactions.into_iter().zip_eq(task_ids))?;
@@ -1539,6 +1547,7 @@ fn confirm_slot_once(
     }?;
     slot_tail_timing::mark(slot, Event::EntriesFetched);
     shred_to_tx_timing::fetched(slot, &completed_ranges);
+    tx_exec_timing::fetched();
 
     // Process block components for Alpenglow slots. Note that we don't need to run migration checks
     // for BlockMarkers here, despite BlockMarkers only being active post-Alpenglow. Here's why:
@@ -1583,6 +1592,12 @@ fn confirm_slot_once(
         match component {
             ParsedBlockComponent::EntryBatch(entries) => {
                 let slot_full = slot_full && ix == last_entry_batch_index.unwrap();
+                if qn_flags::tx_exec_timing() {
+                    tx_exec_timing::set_begin(
+                        slot,
+                        entries.iter().map(|entry| entry.transactions.len()).sum(),
+                    );
+                }
 
                 // Skip block component validation for genesis block. Slot 0 is handled specially,
                 // since it won't have the required block markers.
@@ -1715,6 +1730,7 @@ fn confirm_slot_entries(
     let num_entries = entries.len();
     slot_tail_timing::entries(slot, num_entries);
     slot_tail_timing::mark(slot, Event::EntryBatchStart);
+    tx_exec_timing::mark(Step::OnEntryBatch);
     let mut entry_tx_starting_indexes = Vec::with_capacity(num_entries);
     let mut entry_tx_starting_index = progress.num_txs;
     let num_txs = entries
@@ -1773,6 +1789,7 @@ fn confirm_slot_entries(
     }
 
     slot_tail_timing::mark(slot, Event::TicksVerified);
+    tx_exec_timing::mark(Step::Ticks);
     let last_entry_hash = entries.last().map(|e| e.hash);
     if !skip_verification {
         let start_hash = progress.last_entry;
@@ -1792,6 +1809,7 @@ fn confirm_slot_entries(
     }
 
     slot_tail_timing::mark(slot, Event::PohSpawned);
+    tx_exec_timing::mark(Step::PohSpawn);
     let validate_and_hash_transaction = {
         let bank = bank.clone_with_scheduler();
         move |unsanitized: UnsanitizedTransactionView<Bytes>| {
@@ -1814,11 +1832,13 @@ fn confirm_slot_entries(
         *replay_elapsed += replay_timer.as_us();
         slot_tail_timing::mark(slot, Event::LastEntryScheduled);
         shred_to_tx_timing::scheduled(slot);
+        tx_exec_timing::set_end(slot);
         (vec![], Some(scheduled?))
     } else {
         (entries, None)
     };
 
+    let timing_start = tx_exec_timing::split_start();
     let entry::ValidatedHashedTransactions {
         entries,
         unverified_signatures,
@@ -1837,6 +1857,7 @@ fn confirm_slot_entries(
             return Err(err.into());
         }
     };
+    tx_exec_timing::split_add(Step::TxVerify, timing_start);
     let (unverified_signatures, scheduled_tick_hashes) =
         scheduled_incrementally.unwrap_or((unverified_signatures, vec![]));
     let bank_id = bank.bank_id();
@@ -1853,6 +1874,7 @@ fn confirm_slot_entries(
         }
     } else {
         let replay_vote_sender = replay_vote_sender.cloned();
+        let timing_start = tx_exec_timing::split_start();
         progress
             .async_verification(replay_verification_worker_pool)
             .spawn_signature_verification(
@@ -1862,6 +1884,7 @@ fn confirm_slot_entries(
                 bank_id,
                 replay_vote_sender,
             )?;
+        tx_exec_timing::split_add(Step::SigSpawn, timing_start);
     }
 
     let mut replay_timer = Measure::start("replay_elapsed");
