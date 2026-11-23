@@ -91,6 +91,7 @@ use {
         commitment::BlockCommitmentCache,
         installed_scheduler_pool::BankWithScheduler,
         leader_schedule_utils::first_of_consecutive_leader_slots,
+        qn_flags,
         snapshot_controller::SnapshotController,
         transaction_execution::TransactionStatusSender,
         vote_sender_types::{ReplayVoteMessage, ReplayVoteSender},
@@ -3940,6 +3941,56 @@ impl ReplayStage {
         })
     }
 
+    fn notify_slot_processed_inline(
+        process_active_banks_context: &ProcessActiveBanksContext,
+        bank: &Bank,
+    ) {
+        if process_active_banks_context
+            .bank_notification_sender
+            .is_some()
+            && bank.parent().is_some()
+            && let Some(slot_status_notifier) =
+                process_active_banks_context.slot_status_notifier.as_ref()
+        {
+            slot_status_notifier.read().unwrap().notify_slot_processed(
+                bank.slot(),
+                Some(bank.parent_slot()),
+                bank.bank_id(),
+            );
+        }
+    }
+
+    fn notify_block_metadata(
+        process_active_banks_context: &ProcessActiveBanksContext,
+        bank: &Bank,
+        entry_count: u64,
+    ) {
+        if let Some(block_metadata_notifier) = process_active_banks_context
+            .block_metadata_notifier
+            .as_ref()
+        {
+            let parent_blockhash = bank
+                .parent()
+                .map(|bank| bank.last_blockhash())
+                .unwrap_or_default();
+            let commission_rate_in_basis_points =
+                bank.feature_set.snapshot().commission_rate_in_basis_points;
+            block_metadata_notifier.notify_block_metadata(
+                bank.parent_slot(),
+                &parent_blockhash.to_string(),
+                bank.slot(),
+                bank.bank_id(),
+                &bank.last_blockhash().to_string(),
+                &bank.get_rewards_and_num_partitions(),
+                Some(bank.clock().unix_timestamp),
+                Some(bank.block_height()),
+                bank.executed_transaction_count(),
+                entry_count,
+                commission_rate_in_basis_points,
+            )
+        }
+    }
+
     fn process_replay_results(
         process_active_banks_context: &ProcessActiveBanksContext,
         progress: &mut ProgressMap,
@@ -4121,6 +4172,15 @@ impl ReplayStage {
                     bank.slot(),
                     r_replay_stats.batch_execute.totals
                 );
+                let processed_inline = qn_flags::geyser_processed_inline();
+                if processed_inline {
+                    Self::notify_block_metadata(
+                        process_active_banks_context,
+                        bank,
+                        r_replay_progress.num_entries as u64,
+                    );
+                    Self::notify_slot_processed_inline(process_active_banks_context, bank);
+                }
                 new_frozen_slots.push(bank.slot());
                 if process_active_banks_context
                     .migration_status
@@ -4269,29 +4329,12 @@ impl ReplayStage {
                     }
                 }
 
-                if let Some(block_metadata_notifier) = process_active_banks_context
-                    .block_metadata_notifier
-                    .as_ref()
-                {
-                    let parent_blockhash = bank
-                        .parent()
-                        .map(|bank| bank.last_blockhash())
-                        .unwrap_or_default();
-                    let commission_rate_in_basis_points =
-                        bank.feature_set.snapshot().commission_rate_in_basis_points;
-                    block_metadata_notifier.notify_block_metadata(
-                        bank.parent_slot(),
-                        &parent_blockhash.to_string(),
-                        bank.slot(),
-                        bank.bank_id(),
-                        &bank.last_blockhash().to_string(),
-                        &bank.get_rewards_and_num_partitions(),
-                        Some(bank.clock().unix_timestamp),
-                        Some(bank.block_height()),
-                        bank.executed_transaction_count(),
+                if !processed_inline {
+                    Self::notify_block_metadata(
+                        process_active_banks_context,
+                        bank,
                         r_replay_progress.num_entries as u64,
-                        commission_rate_in_basis_points,
-                    )
+                    );
                 }
                 bank_complete_time.stop();
 

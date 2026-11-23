@@ -388,10 +388,16 @@ impl OptimisticallyConfirmedBankTracker {
                         },
                     });
 
-                    Self::notify_slot_status(
-                        slot_notification_subscribers,
-                        SlotNotification::Frozen((bank.slot(), bank.parent_slot(), bank.bank_id())),
-                    );
+                    if !solana_runtime::qn_flags::geyser_processed_inline() {
+                        Self::notify_slot_status(
+                            slot_notification_subscribers,
+                            SlotNotification::Frozen((
+                                bank.slot(),
+                                bank.parent_slot(),
+                                bank.bank_id(),
+                            )),
+                        );
+                    }
                 }
 
                 if pending_optimistically_confirmed_banks.remove(&(bank.slot(), bank.hash())) {
