@@ -1,6 +1,9 @@
 use {
     crate::{
-        bank::{Bank, TransactionBalancesSet},
+        bank::{
+            Bank, TransactionBalancesSet,
+            speculation::{Speculation, SpeculationInputs},
+        },
         bank_utils,
         dependency_tracker::DependencyTracker,
         prioritization_fee_cache::PrioritizationFeeCache,
@@ -181,6 +184,43 @@ pub fn execute_batch_until_commit<'a>(
     timings: &'a mut ExecuteTimings,
     log_messages_bytes_limit: Option<usize>,
 ) -> TransactionResult<BatchPostCommit> {
+    execute_batch_until_commit_with_speculation(
+        batch,
+        bank,
+        transaction_status_sender,
+        replay_vote_sender,
+        replay_vote_send_type,
+        timings,
+        log_messages_bytes_limit,
+        None,
+    )
+}
+
+pub fn speculate_batch(
+    batch: &TransactionBatch<impl TransactionWithMeta>,
+    record_transaction_status: bool,
+    log_messages_bytes_limit: Option<usize>,
+    inputs: &Arc<SpeculationInputs>,
+) -> Option<Speculation> {
+    batch.bank().speculate_transactions(
+        batch,
+        ExecutionRecordingConfig::new_single_setting(record_transaction_status),
+        log_messages_bytes_limit,
+        inputs,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn execute_batch_until_commit_with_speculation<'a>(
+    batch: &'a TransactionBatchWithIndexes<impl TransactionWithMeta>,
+    bank: &'a Arc<Bank>,
+    transaction_status_sender: Option<&'a TransactionStatusSender>,
+    replay_vote_sender: Option<&'a ReplayVoteSender>,
+    replay_vote_send_type: ReplayVoteSendType,
+    timings: &'a mut ExecuteTimings,
+    log_messages_bytes_limit: Option<usize>,
+    speculation: Option<Speculation>,
+) -> TransactionResult<BatchPostCommit> {
     let TransactionBatchWithIndexes {
         batch,
         transaction_indexes,
@@ -223,12 +263,13 @@ pub fn execute_batch_until_commit<'a>(
 
     let (commit_results, balance_collector) = batch
         .bank()
-        .load_execute_and_commit_transactions_with_pre_commit_access(
+        .load_execute_and_commit_transactions_with_pre_commit_access_and_speculation(
             batch,
             ExecutionRecordingConfig::new_single_setting(record_transaction_status),
             timings,
             log_messages_bytes_limit,
             pre_commit_callback,
+            speculation,
         )?;
     slot_tail_timing::tx_committed(bank.slot());
     crate::shred_to_tx_timing::committed(bank.slot(), transaction_indexes);

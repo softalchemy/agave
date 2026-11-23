@@ -108,6 +108,33 @@ pub fn account_prefetch_pool() -> &'static ThreadPool {
     &ACCOUNT_PREFETCH_POOL
 }
 
+static SCHED_OPTIMISTIC: LazyLock<bool> = LazyLock::new(|| enabled("AGAVE_SCHED_OPTIMISTIC"));
+static SCHED_OPTIMISTIC_VERIFY: LazyLock<bool> = LazyLock::new(|| {
+    requires(
+        "AGAVE_SCHED_OPTIMISTIC_VERIFY",
+        "AGAVE_SCHED_OPTIMISTIC",
+        *SCHED_OPTIMISTIC,
+    )
+});
+static SCHED_OPTIMISTIC_RESERVE: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("AGAVE_SCHED_OPTIMISTIC_RESERVE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1)
+});
+
+pub fn sched_optimistic() -> bool {
+    *SCHED_OPTIMISTIC
+}
+
+pub fn sched_optimistic_verify() -> bool {
+    *SCHED_OPTIMISTIC_VERIFY
+}
+
+pub fn sched_optimistic_reserve() -> usize {
+    *SCHED_OPTIMISTIC_RESERVE
+}
+
 pub fn sched_finish_before_notify() -> bool {
     *SCHED_FINISH_BEFORE_NOTIFY
 }
@@ -352,6 +379,13 @@ pub fn log_flags() {
         },
         replay_entries_fast_path(),
         replay_streaming(),
+    );
+    info!(
+        "qn optimistic flags: sched_optimistic={} sched_optimistic_verify={} \
+         sched_optimistic_reserve={}",
+        sched_optimistic(),
+        sched_optimistic_verify(),
+        sched_optimistic_reserve(),
     );
     if replay_streaming_test_split() > 0 {
         warn!(

@@ -186,7 +186,7 @@ impl SlotRecord {
     }
 }
 
-const PREFETCH_LEN: usize = 12;
+const PREFETCH_LEN: usize = 23;
 
 #[derive(Clone, Copy)]
 #[repr(usize)]
@@ -203,6 +203,17 @@ pub enum Prefetch {
     JobMax,
     LagMax,
     EndMax,
+    SpecSpeculated,
+    SpecUnusable,
+    SpecValid,
+    SpecInvalid,
+    SpecReexecuted,
+    SpecVerifyMismatch,
+    SpecCpuSum,
+    SpecSavedSum,
+    SpecWaited,
+    SpecWaitSum,
+    SpecAbandoned,
 }
 
 const PREFETCH_NAMES: [&str; PREFETCH_LEN] = [
@@ -218,6 +229,17 @@ const PREFETCH_NAMES: [&str; PREFETCH_LEN] = [
     "prefetch_job_max_us",
     "prefetch_lag_max_us",
     "prefetch_end_max_us",
+    "spec_speculated",
+    "spec_unusable",
+    "spec_valid",
+    "spec_invalid",
+    "spec_reexecuted",
+    "spec_verify_mismatch",
+    "spec_cpu_sum_us",
+    "spec_saved_sum_us",
+    "spec_waited",
+    "spec_wait_sum_us",
+    "spec_abandoned",
 ];
 
 struct Split {

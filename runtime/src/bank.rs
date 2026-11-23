@@ -248,6 +248,7 @@ mod address_lookup_table;
 pub mod bank_hash_details;
 pub mod builtins;
 mod check_transactions;
+pub mod speculation;
 pub mod entry_bytes_budget;
 mod fee_distribution;
 mod metrics;
@@ -2730,6 +2731,7 @@ impl Bank {
         // actually updated since tests don't need to be optimized for performance.
         self.transaction_processor
             .reset_and_fill_sysvar_cache_entries(self);
+        speculation::environment_changed();
     }
 
     fn update_slot_history(&self) {
@@ -3665,6 +3667,7 @@ impl Bank {
 
         self.transaction_processor
             .reset_and_fill_sysvar_cache_entries(self);
+        speculation::environment_changed();
     }
 
     /// Get the nanosecond clock value. Returns `None` if the nanosecond clock has not been
@@ -4256,6 +4259,29 @@ impl Bank {
         error_counters: &mut TransactionErrorMetrics,
         processing_config: TransactionProcessingConfig,
     ) -> LoadAndExecuteTransactionsOutput {
+        self.load_and_execute_transactions_with_callbacks(
+            self,
+            true,
+            batch,
+            max_age,
+            timings,
+            error_counters,
+            processing_config,
+        )
+    }
+
+    fn load_and_execute_transactions_with_callbacks<
+        CB: TransactionProcessingCallback + InvokeContextCallback,
+    >(
+        &self,
+        callbacks: &CB,
+        record_logs: bool,
+        batch: &TransactionBatch<impl TransactionWithMeta>,
+        max_age: usize,
+        timings: &mut ExecuteTimings,
+        error_counters: &mut TransactionErrorMetrics,
+        processing_config: TransactionProcessingConfig,
+    ) -> LoadAndExecuteTransactionsOutput {
         let sanitized_txs = batch.sanitized_transactions();
 
         let (check_results, check_us) = measure_us!(self.check_transactions_before_execution(
@@ -4295,7 +4321,7 @@ impl Bank {
         let sanitized_output = self
             .transaction_processor
             .load_and_execute_sanitized_transactions(
-                self,
+                callbacks,
                 sanitized_txs,
                 check_results,
                 &processing_environment,
@@ -4308,8 +4334,9 @@ impl Bank {
         // Accumulate the transaction batch execution timings.
         timings.accumulate(&sanitized_output.execute_timings);
 
-        let ((), collect_logs_us) =
-            measure_us!(self.collect_logs(sanitized_txs, &sanitized_output.processing_results));
+        let ((), collect_logs_us) = measure_us!(if record_logs {
+            self.collect_logs(sanitized_txs, &sanitized_output.processing_results)
+        });
         timings.saturating_add_in_place(ExecuteTimingType::CollectLogsUs, collect_logs_us);
 
         let mut processed_counts = ProcessedTransactionCounts::default();
@@ -4320,7 +4347,11 @@ impl Bank {
             .iter()
             .zip(sanitized_txs)
         {
-            if let Some(debug_keys) = &self.transaction_debug_keys {
+            if let Some(debug_keys) = self
+                .transaction_debug_keys
+                .as_ref()
+                .filter(|_| record_logs)
+            {
                 for key in tx.account_keys().iter() {
                     if debug_keys.contains(key) {
                         let result = processing_result.flattened_result();
@@ -4650,6 +4681,7 @@ impl Bank {
                                 self.slot,
                                 programs_modified_by_tx,
                             );
+                        speculation::environment_changed();
                     }
                 }
             }
@@ -4887,6 +4919,7 @@ impl Bank {
             timings,
             log_messages_bytes_limit,
             None::<fn(&mut Vec<TransactionProcessingResult>, &mut Option<BalanceCollector>) -> _>,
+            None,
         )
         .unwrap()
     }
@@ -4910,6 +4943,7 @@ impl Bank {
                     pre_commit_callback(processing_results.as_slice())
                 },
             ),
+            None,
         )
     }
 
@@ -4930,6 +4964,29 @@ impl Bank {
             timings,
             log_messages_bytes_limit,
             Some(pre_commit_callback),
+            None,
+        )
+    }
+
+    pub fn load_execute_and_commit_transactions_with_pre_commit_access_and_speculation(
+        &self,
+        batch: &TransactionBatch<impl TransactionWithMeta>,
+        recording_config: ExecutionRecordingConfig,
+        timings: &mut ExecuteTimings,
+        log_messages_bytes_limit: Option<usize>,
+        pre_commit_callback: impl FnOnce(
+            &mut Vec<TransactionProcessingResult>,
+            &mut Option<BalanceCollector>,
+        ) -> Result<()>,
+        speculation: Option<speculation::Speculation>,
+    ) -> Result<(Vec<TransactionCommitResult>, Option<BalanceCollector>)> {
+        self.do_load_execute_and_commit_transactions_with_pre_commit_callback(
+            batch,
+            recording_config,
+            timings,
+            log_messages_bytes_limit,
+            Some(pre_commit_callback),
+            speculation,
         )
     }
 
@@ -4945,6 +5002,7 @@ impl Bank {
                 &mut Option<BalanceCollector>,
             ) -> Result<()>,
         >,
+        speculation: Option<speculation::Speculation>,
     ) -> Result<(Vec<TransactionCommitResult>, Option<BalanceCollector>)> {
         let execution_guard = self.try_enter_transaction_execution();
         let LoadAndExecuteTransactionsOutput {
@@ -4952,23 +5010,34 @@ impl Bank {
             processed_counts,
             mut balance_collector,
         } = if let Some(execution_guard) = execution_guard.as_ref() {
-            execution_guard.load_and_execute_transactions(
-                batch,
-                self.max_processing_age(),
-                timings,
-                &mut TransactionErrorMetrics::default(),
-                TransactionProcessingConfig {
-                    account_overrides: None,
-                    log_messages_bytes_limit,
-                    limit_to_load_programs: false,
+            if speculation.is_some() {
+                self.load_and_execute_or_accept_speculation(
+                    execution_guard,
+                    batch,
                     recording_config,
-                    drop_on_failure: false,
-                    all_or_nothing: false,
-                    strict_nonce_size_check: false,
-                    drop_noop_transactions: false,
-                    drop_bail_out_transactions: false,
-                },
-            )
+                    timings,
+                    log_messages_bytes_limit,
+                    speculation,
+                )
+            } else {
+                execution_guard.load_and_execute_transactions(
+                    batch,
+                    self.max_processing_age(),
+                    timings,
+                    &mut TransactionErrorMetrics::default(),
+                    TransactionProcessingConfig {
+                        account_overrides: None,
+                        log_messages_bytes_limit,
+                        limit_to_load_programs: false,
+                        recording_config,
+                        drop_on_failure: false,
+                        all_or_nothing: false,
+                        strict_nonce_size_check: false,
+                        drop_noop_transactions: false,
+                        drop_bail_out_transactions: false,
+                    },
+                )
+            }
         } else {
             Self::cancelled_load_and_execute_tx_batch(batch)
         };
