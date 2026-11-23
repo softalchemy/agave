@@ -6,6 +6,7 @@ use {
         },
         installed_scheduler_pool::BankWithScheduler,
         leader_schedule_utils::leader_slot_index,
+        qn_flags,
         slot_tail_timing::{self, Event},
         validated_block_finalization::{
             BlockFinalizationCertError, ValidatedBlockFinalizationCert,
@@ -617,20 +618,42 @@ impl BlockComponentProcessor {
             notar_reward_cert,
         } = footer;
 
-        let reward_cert = ValidatedRewardCert::try_new(
-            bank,
-            shred_version,
-            &skip_reward_cert,
-            &notar_reward_cert,
-        )?;
-        let block_producer_time_nanos =
-            Self::block_producer_time_nanos_as_i64(block_producer_time_nanos)?;
-        let final_cert = block_final_cert
-            .map(|final_cert| {
-                ValidatedBlockFinalizationCert::try_from_footer(final_cert, bank, shred_version)
+        let verify_bank: &Bank = bank;
+        let verify_reward_cert = || {
+            ValidatedRewardCert::try_new(
+                verify_bank,
+                shred_version,
+                &skip_reward_cert,
+                &notar_reward_cert,
+            )
+        };
+        let verify_final_cert = || {
+            block_final_cert
+                .map(|final_cert| {
+                    ValidatedBlockFinalizationCert::try_from_footer(
+                        final_cert,
+                        verify_bank,
+                        shred_version,
+                    )
                     .map_err(BlockComponentProcessorError::InvalidFinalizationCertificate)
-            })
-            .transpose()?;
+                })
+                .transpose()
+        };
+        let (reward_cert, block_producer_time_nanos, final_cert) =
+            if qn_flags::footer_cert_verify_parallel() {
+                let (reward_cert, final_cert) = qn_flags::join(verify_reward_cert, verify_final_cert);
+                (
+                    reward_cert?,
+                    Self::block_producer_time_nanos_as_i64(block_producer_time_nanos)?,
+                    final_cert?,
+                )
+            } else {
+                (
+                    verify_reward_cert()?,
+                    Self::block_producer_time_nanos_as_i64(block_producer_time_nanos)?,
+                    verify_final_cert()?,
+                )
+            };
 
         let (footer_input, pool_input) = match final_cert {
             None => (None, None),

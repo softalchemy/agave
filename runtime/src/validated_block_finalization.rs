@@ -119,8 +119,19 @@ impl ValidatedBlockFinalizationCert {
             };
 
             // Verify both certificates
-            let notar_signature = Self::verify_certificate(bank, unverified_notar_cert)?;
-            let finalize_signature = Self::verify_certificate(bank, unverified_finalize_cert)?;
+            let (notar_signature, finalize_signature) =
+                if crate::qn_flags::footer_cert_verify_parallel() {
+                    let (notar_signature, finalize_signature) = crate::qn_flags::join(
+                        || Self::verify_certificate(bank, unverified_notar_cert),
+                        || Self::verify_certificate(bank, unverified_finalize_cert),
+                    );
+                    (notar_signature?, finalize_signature?)
+                } else {
+                    (
+                        Self::verify_certificate(bank, unverified_notar_cert)?,
+                        Self::verify_certificate(bank, unverified_finalize_cert)?,
+                    )
+                };
 
             let finalize_signers =
                 Self::extract_signers(bank, finalize_cert_type, &finalize_signature.bitmap)?;
