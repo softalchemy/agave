@@ -13,6 +13,10 @@ use {
         storable_accounts::StorableAccounts,
     },
     log::*,
+    rayon::{
+        ThreadPool,
+        iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator},
+    },
     solana_account::{AccountSharedData, ReadableAccount},
     solana_address_lookup_table_interface::{
         self as address_lookup_table, error::AddressLookupError, state::AddressLookupTable,
@@ -31,10 +35,13 @@ use {
         collections::{BinaryHeap, HashMap, HashSet},
         sync::{
             Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicU64, AtomicUsize, Ordering},
         },
     },
 };
+
+pub const LARGE_STORE_NUM_ACCOUNTS: usize = 64;
+pub static LARGE_STORE_GEYSER_NOTIFY_NS: AtomicU64 = AtomicU64::new(0);
 
 pub type PubkeyAccountSlot = (Pubkey, AccountSharedData, Slot);
 
@@ -515,6 +522,8 @@ impl Accounts {
     ) {
         let accounts_db = &self.accounts_db;
         if accounts_db.has_accounts_update_notifier() {
+            let notify_start =
+                (accounts.len() >= LARGE_STORE_NUM_ACCOUNTS).then(std::time::Instant::now);
             let mut current_write_version = accounts_db
                 .write_version
                 .fetch_add(accounts.len() as u64, Ordering::AcqRel);
@@ -534,9 +543,52 @@ impl Accounts {
                 });
                 current_write_version = current_write_version.saturating_add(1);
             }
+            if let Some(notify_start) = notify_start {
+                LARGE_STORE_GEYSER_NOTIFY_NS
+                    .store(notify_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
         }
 
         accounts_db.store_accounts_unfrozen(accounts, ancestors);
+    }
+
+    pub fn store_accounts_with_parallel_notify(
+        &self,
+        slot: Slot,
+        accounts: &[(Pubkey, AccountSharedData)],
+        bank_id: BankId,
+        ancestors: &Ancestors,
+        thread_pool: &ThreadPool,
+    ) {
+        let accounts_db = &self.accounts_db;
+        if !accounts_db.has_accounts_update_notifier() {
+            accounts_db.store_accounts_unfrozen((slot, accounts), ancestors);
+            return;
+        }
+        let first_write_version = accounts_db
+            .write_version
+            .fetch_add(accounts.len() as u64, Ordering::AcqRel);
+        thread_pool.in_place_scope(|scope| {
+            scope.spawn(|_| {
+                let notify_start = std::time::Instant::now();
+                accounts
+                    .par_iter()
+                    .enumerate()
+                    .for_each(|(index, (pubkey, account))| {
+                        accounts_db.notify_account_at_accounts_update(
+                            slot,
+                            bank_id,
+                            account,
+                            &None,
+                            pubkey,
+                            first_write_version.saturating_add(index as u64),
+                        );
+                    });
+                LARGE_STORE_GEYSER_NOTIFY_NS
+                    .store(notify_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            });
+            accounts_db.store_accounts_unfrozen((slot, accounts), ancestors);
+        });
     }
 
     /// Add a slot to root.  Root slots cannot be purged

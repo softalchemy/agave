@@ -3,6 +3,7 @@ use {
         bank::Bank,
         block_component_processor::vote_reward::{
             CalcVoteRewardUpdateVoteStatesError, calc_vote_rewards_update_vote_states,
+            compute_vote_reward_accounts, store_vote_reward_accounts,
         },
         installed_scheduler_pool::BankWithScheduler,
         leader_schedule_utils::leader_slot_index,
@@ -31,11 +32,15 @@ use {
         },
         entry::EntryView,
     },
+    solana_account::AccountSharedData,
     solana_hash::Hash,
     solana_pubkey::Pubkey,
     solana_svm_timings::ExecuteTimings,
     solana_transaction_error::TransactionError,
-    std::{collections::HashSet, sync::Arc},
+    std::{
+        collections::{HashMap, HashSet},
+        sync::Arc,
+    },
     thiserror::Error,
 };
 
@@ -609,6 +614,17 @@ impl BlockComponentProcessor {
 
         Self::enforce_nanosecond_clock_bounds(bank, &parent_bank, &footer)?;
 
+        if qn_flags::footer_rewards_overlap() || qn_flags::geyser_processed_at_footer() {
+            return Self::on_footer_scheduler_first(
+                my_pubkey,
+                bank,
+                shred_version,
+                footer,
+                finalization_cert_sender,
+                execute_timings,
+            );
+        }
+
         let BlockFooterV1 {
             bank_hash,
             block_producer_time_nanos,
@@ -707,6 +723,234 @@ impl BlockComponentProcessor {
         }
 
         Ok(())
+    }
+
+    fn on_footer_scheduler_first(
+        my_pubkey: &Pubkey,
+        bank: &BankWithScheduler,
+        shred_version: u16,
+        footer: BlockFooterV1,
+        finalization_cert_sender: Option<&Sender<SmallVec<[Certificate; 2]>>>,
+        execute_timings: &mut ExecuteTimings,
+    ) -> Result<(), BlockComponentProcessorError> {
+        let BlockFooterV1 {
+            bank_hash,
+            block_producer_time_nanos,
+            block_user_agent: _,
+            block_final_cert,
+            skip_reward_cert,
+            notar_reward_cert,
+        } = footer;
+
+        let scheduler_result = bank
+            .wait_for_completed_scheduler()
+            .map(|(result, execute_time)| {
+                execute_timings.accumulate(&execute_time);
+                result
+            });
+        slot_tail_timing::mark(bank.slot(), Event::FooterSchedulerWaited);
+        let scheduler_ok = matches!(scheduler_result, Some(Ok(())));
+        if scheduler_ok && bank.parent().is_some() {
+            qn_flags::notify_processed_at_footer(bank.slot(), bank.parent_slot(), bank.bank_id());
+        }
+
+        let verify_bank: &Bank = bank;
+        let block_producer_time_nanos =
+            Self::block_producer_time_nanos_as_i64(block_producer_time_nanos);
+        let speculative_inputs = match &block_producer_time_nanos {
+            Ok(time_nanos) if qn_flags::footer_rewards_overlap() && scheduler_ok => {
+                let reward_cert = ValidatedRewardCert::speculative(
+                    verify_bank,
+                    &skip_reward_cert,
+                    &notar_reward_cert,
+                );
+                let final_cert_input = match &block_final_cert {
+                    None => Some(None),
+                    Some(cert) => {
+                        ValidatedBlockFinalizationCert::speculative_signers(cert, verify_bank)
+                            .map(Some)
+                    }
+                };
+                reward_cert
+                    .zip(final_cert_input)
+                    .map(|(reward_cert, final_cert_input)| {
+                        (reward_cert, final_cert_input, *time_nanos)
+                    })
+            }
+            _ => None,
+        };
+
+        let verify_certs = || {
+            let verify_reward_cert = || {
+                ValidatedRewardCert::try_new(
+                    verify_bank,
+                    shred_version,
+                    &skip_reward_cert,
+                    &notar_reward_cert,
+                )
+            };
+            let verify_final_cert = || {
+                block_final_cert
+                    .clone()
+                    .map(|final_cert| {
+                        ValidatedBlockFinalizationCert::try_from_footer(
+                            final_cert,
+                            verify_bank,
+                            shred_version,
+                        )
+                        .map_err(BlockComponentProcessorError::InvalidFinalizationCertificate)
+                    })
+                    .transpose()
+            };
+            let certs = if qn_flags::footer_cert_verify_parallel() {
+                qn_flags::join(verify_reward_cert, verify_final_cert)
+            } else {
+                (verify_reward_cert(), verify_final_cert())
+            };
+            slot_tail_timing::mark(verify_bank.slot(), Event::FooterCertsVerified);
+            certs
+        };
+        let ((reward_cert, final_cert), speculative) = match speculative_inputs {
+            Some((speculative_reward_cert, speculative_final_cert_input, time_nanos)) => {
+                let compute = || {
+                    let accounts = compute_vote_reward_accounts(
+                        verify_bank,
+                        &speculative_reward_cert,
+                        speculative_final_cert_input
+                            .as_ref()
+                            .map(|(signers, slot)| (signers, *slot)),
+                        time_nanos,
+                        qn_flags::footer_rewards_parallel(),
+                    );
+                    slot_tail_timing::mark(verify_bank.slot(), Event::FooterAccountsComputed);
+                    accounts
+                };
+                let (certs, accounts) = qn_flags::join(verify_certs, compute);
+                (
+                    certs,
+                    Some((
+                        speculative_reward_cert,
+                        speculative_final_cert_input,
+                        accounts,
+                    )),
+                )
+            }
+            None => (verify_certs(), None),
+        };
+        let reward_cert = reward_cert?;
+        let block_producer_time_nanos = block_producer_time_nanos?;
+        let final_cert = final_cert?;
+        if let Some(result) = scheduler_result {
+            result?;
+        }
+
+        let (footer_input, pool_input) = match final_cert {
+            None => (None, None),
+            Some(cert) => {
+                let (signers, finalize_cert, notarize_cert) = cert.into_parts();
+                let final_slot = finalize_cert.cert_type.slot();
+                (
+                    Some((signers, final_slot)),
+                    Some((finalize_cert, notarize_cert)),
+                )
+            }
+        };
+
+        let compute = |parallel| {
+            compute_vote_reward_accounts(
+                verify_bank,
+                &reward_cert,
+                footer_input
+                    .as_ref()
+                    .map(|(validators, slot)| (validators, *slot)),
+                block_producer_time_nanos,
+                parallel,
+            )
+            .map_err(BankFooterError::from)
+        };
+        let updated_accounts = match speculative {
+            Some((speculative_reward_cert, speculative_final_cert_input, accounts))
+                if speculative_final_cert_input == footer_input
+                    && match (&speculative_reward_cert, &reward_cert) {
+                        (None, None) => true,
+                        (Some(speculative), Some(verified)) => speculative.same_as(verified),
+                        _ => false,
+                    } =>
+            {
+                accounts.map_err(BankFooterError::from)?
+            }
+            Some(_) => {
+                warn!(
+                    "slot {}: speculative footer reward inputs differ from verified inputs",
+                    bank.slot()
+                );
+                compute(qn_flags::footer_rewards_parallel())?
+            }
+            None => compute(qn_flags::footer_rewards_parallel())?,
+        };
+        let updated_accounts = if qn_flags::footer_self_check() {
+            Self::footer_self_check(bank.slot(), updated_accounts, compute(false)?)
+        } else {
+            updated_accounts
+        };
+        slot_tail_timing::mark(bank.slot(), Event::FooterAccountsComputed);
+
+        bank.update_clock_from_footer(block_producer_time_nanos);
+        if let Some(updated_accounts) = updated_accounts {
+            store_vote_reward_accounts(bank, updated_accounts);
+        }
+        bank.set_expected_bank_hash(bank_hash);
+        slot_tail_timing::mark(bank.slot(), Event::FooterDone);
+
+        if let Some((finalize_cert, notarize_cert)) = pool_input
+            && let Some(sender) = finalization_cert_sender
+        {
+            let channel_name = "finalization_cert_sender";
+            let certs = match notarize_cert {
+                None => smallvec![finalize_cert],
+                Some(c) => smallvec![finalize_cert, c],
+            };
+            match sender.try_send(certs) {
+                Ok(()) => (),
+                Err(TrySendError::Full(_)) => {
+                    warn!("{my_pubkey}: channel \"{channel_name}\" is full, dropping msg")
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    warn!("{my_pubkey}: channel \"{channel_name}\" disconnected")
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn footer_self_check(
+        slot: Slot,
+        updated_accounts: Option<Vec<(Pubkey, AccountSharedData)>>,
+        reference_accounts: Option<Vec<(Pubkey, AccountSharedData)>>,
+    ) -> Option<Vec<(Pubkey, AccountSharedData)>> {
+        let as_map = |accounts: &Option<Vec<(Pubkey, AccountSharedData)>>| {
+            accounts
+                .as_ref()
+                .map(|accounts| accounts.iter().cloned().collect::<HashMap<_, _>>())
+        };
+        let matches = as_map(&updated_accounts) == as_map(&reference_accounts);
+        datapoint_info!(
+            "footer_self_check",
+            ("slot", slot as i64, i64),
+            ("matches", matches, bool),
+            (
+                "accounts",
+                reference_accounts.as_ref().map_or(0, Vec::len) as i64,
+                i64
+            ),
+        );
+        if matches {
+            updated_accounts
+        } else {
+            error!("slot {slot}: footer reward accounts differ from the serial reference");
+            reference_accounts
+        }
     }
 
     fn on_header(

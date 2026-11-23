@@ -1471,7 +1471,56 @@ pub fn confirm_slot(
     allow_dead_slots: bool,
     migration_status: &MigrationStatus,
 ) -> result::Result<(), BlockstoreProcessorError> {
+    let footer_without_final_component = confirm_slot_once(
+        blockstore,
+        bank,
+        shred_version,
+        replay_verification_worker_pool,
+        timing,
+        progress,
+        skip_verification,
+        entry_notification_sender,
+        replay_vote_sender,
+        finalization_cert_sender,
+        allow_dead_slots,
+        migration_status,
+    )?;
+    if footer_without_final_component && qn_flags::replay_refetch_after_footer() {
+        confirm_slot_once(
+            blockstore,
+            bank,
+            shred_version,
+            replay_verification_worker_pool,
+            timing,
+            progress,
+            skip_verification,
+            entry_notification_sender,
+            replay_vote_sender,
+            finalization_cert_sender,
+            allow_dead_slots,
+            migration_status,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn confirm_slot_once(
+    blockstore: &Blockstore,
+    bank: &BankWithScheduler,
+    shred_version: u16,
+    replay_verification_worker_pool: &ReplayVerificationWorkerPool,
+    timing: &mut ConfirmationTiming,
+    progress: &mut ConfirmationProgress,
+    skip_verification: bool,
+    entry_notification_sender: Option<&EntryNotifierSender>,
+    replay_vote_sender: Option<&ReplayVoteSender>,
+    finalization_cert_sender: Option<&Sender<SmallVec<[Certificate; 2]>>>,
+    allow_dead_slots: bool,
+    migration_status: &MigrationStatus,
+) -> result::Result<bool, BlockstoreProcessorError> {
     let slot = bank.slot();
+    let mut footer_without_final_component = false;
 
     let (slot_components, completed_ranges, slot_full) = {
         let mut load_elapsed = Measure::start("load_elapsed");
@@ -1561,6 +1610,7 @@ pub fn confirm_slot(
                 let block_footer = match &marker {
                     VersionedBlockMarker::V1(marker) => marker.as_block_footer().cloned(),
                 };
+                footer_without_final_component = block_footer.is_some() && !slot_full;
                 if let Some(parent_bank) = bank.parent() {
                     let allow_initial_update_parent =
                         replay_starts_at_update_parent && marker.is_update_parent();
@@ -1616,7 +1666,7 @@ pub fn confirm_slot(
         }
     }
 
-    Ok(())
+    Ok(footer_without_final_component)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1653,6 +1703,7 @@ fn confirm_slot_entries(
     }
     let num_entries = entries.len();
     slot_tail_timing::entries(slot, num_entries);
+    slot_tail_timing::mark(slot, Event::EntryBatchStart);
     let mut entry_tx_starting_indexes = Vec::with_capacity(num_entries);
     let mut entry_tx_starting_index = progress.num_txs;
     let num_txs = entries
@@ -1710,6 +1761,7 @@ fn confirm_slot_entries(
         )?;
     }
 
+    slot_tail_timing::mark(slot, Event::TicksVerified);
     let last_entry_hash = entries.last().map(|e| e.hash);
     if !skip_verification {
         let start_hash = progress.last_entry;
@@ -1728,6 +1780,7 @@ fn confirm_slot_entries(
             )?;
     }
 
+    slot_tail_timing::mark(slot, Event::PohSpawned);
     let validate_and_hash_transaction = {
         let bank = bank.clone_with_scheduler();
         move |unsanitized: UnsanitizedTransactionView<Bytes>| {

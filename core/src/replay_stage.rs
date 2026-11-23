@@ -821,6 +821,22 @@ impl ReplayStage {
             .map_or(0, |hfs| hfs.slot());
         *replay_highest_frozen.highest_frozen_slot.lock().unwrap() = highest_frozen_slot;
 
+        if qn_flags::geyser_processed_at_footer()
+            && bank_notification_sender.is_some()
+            && let Some(slot_status_notifier) = slot_status_notifier.clone()
+        {
+            let installed = qn_flags::PROCESSED_AT_FOOTER_NOTIFIER
+                .set(Box::new(move |slot, parent_slot, bank_id| {
+                    slot_status_notifier.read().unwrap().notify_slot_processed(
+                        slot,
+                        Some(parent_slot),
+                        bank_id,
+                    );
+                }))
+                .is_ok();
+            info!("geyser processed at footer notifier installed: {installed}");
+        }
+
         let run_replay = move || {
             if let Some(arena) = replay_arena {
                 arena
@@ -3916,12 +3932,14 @@ impl ReplayStage {
             scheduler_replay_outcome,
             SchedulerReplayOutcome::SchedulerReplayCompleted(_)
         );
-        let processed_notified = qn_flags::geyser_processed_early()
-            && matches!(
-                scheduler_replay_outcome,
-                SchedulerReplayOutcome::SchedulerReplayCompleted(Ok(()))
-            );
-        if processed_notified {
+        let processed_at_footer = qn_flags::processed_at_footer_emitted(bank.bank_id());
+        let processed_notified = processed_at_footer
+            || (qn_flags::geyser_processed_early()
+                && matches!(
+                    scheduler_replay_outcome,
+                    SchedulerReplayOutcome::SchedulerReplayCompleted(Ok(()))
+                ));
+        if processed_notified && !processed_at_footer {
             Self::notify_slot_processed_inline(process_active_banks_context, bank);
         }
         let verify_result = Self::complete_replay_verification(

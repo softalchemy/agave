@@ -189,6 +189,40 @@ impl ValidatedBlockFinalizationCert {
     /// # Safety
     /// The caller must ensure that the provided certificates have been properly validated.
     /// Using unvalidated certificates will compromise the type's safety guarantees.
+    pub(crate) fn speculative_signers(
+        block_final_cert: &BlockFinalizationCert,
+        bank: &Bank,
+    ) -> Option<(HashSet<Pubkey>, Slot)> {
+        let block = Block {
+            slot: block_final_cert.slot,
+            block_id: block_final_cert.block_id,
+        };
+        let signers = if let Some(notar_aggregate) = &block_final_cert.notar_aggregate {
+            let finalize_signers = Self::extract_signers(
+                bank,
+                CertificateType::Finalize(block.slot),
+                block_final_cert.final_aggregate.bitmap(),
+            )
+            .ok()?;
+            let mut signers = Self::extract_signers(
+                bank,
+                CertificateType::Notarize(block),
+                notar_aggregate.bitmap(),
+            )
+            .ok()?;
+            signers.extend(finalize_signers);
+            signers
+        } else {
+            Self::extract_signers(
+                bank,
+                CertificateType::FinalizeFast(block),
+                block_final_cert.final_aggregate.bitmap(),
+            )
+            .ok()?
+        };
+        Some((signers, block.slot))
+    }
+
     pub fn from_validated_slow(
         finalize_cert: FinalizeCert,
         notarize_cert: NotarCert,

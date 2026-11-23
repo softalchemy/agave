@@ -10,6 +10,7 @@ use {
     solana_bls_signatures::BlsError,
     solana_clock::Slot,
     solana_pubkey::Pubkey,
+    solana_signer_store::{Decoded, decode},
     std::collections::HashSet,
     thiserror::Error,
 };
@@ -209,6 +210,46 @@ impl ValidatedRewardCert {
     /// tracks the validator set while aggregating them, so block production
     /// only needs the reward slot and validator set for bank reward
     /// calculation.
+    pub(crate) fn speculative(
+        bank: &Bank,
+        skip: &Option<SkipRewardCertificate>,
+        notar: &Option<NotarRewardCertificate>,
+    ) -> Option<Option<Self>> {
+        let reward_slot = match extract_slot(bank, skip, notar) {
+            Ok(Some(reward_slot)) => reward_slot,
+            Ok(None) => return Some(None),
+            Err(_) => return None,
+        };
+        let rank_map = bank
+            .epoch_stakes_from_slot(reward_slot)?
+            .bls_pubkey_to_rank_map();
+        let max_validators = rank_map.len();
+        let mut validators = HashSet::with_capacity(max_validators);
+        let bitmaps = [
+            skip.as_ref().map(|skip| skip.to_bitmap()),
+            notar.as_ref().map(|notar| notar.bitmap()),
+        ];
+        for bitmap in bitmaps.into_iter().flatten() {
+            let Ok(Decoded::Base2(ranks)) = decode(bitmap, max_validators) else {
+                return None;
+            };
+            for rank in ranks.iter_ones() {
+                validators.insert(rank_map.get_pubkey_stake_entry(rank)?.vote_account_pubkey);
+            }
+        }
+        if validators.is_empty() {
+            return Some(None);
+        }
+        Some(Some(Self {
+            validators,
+            reward_slot,
+        }))
+    }
+
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        self.reward_slot == other.reward_slot && self.validators == other.validators
+    }
+
     pub fn try_new_for_leader(
         bank: &Bank,
         skip: &Option<SkipRewardCertificate>,

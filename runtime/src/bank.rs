@@ -40,6 +40,7 @@ pub use {
 };
 use {
     crate::{
+        slot_tail_timing,
         account_saver::collect_accounts_to_store,
         alpenglow_epoch_type::{AlpenglowEpochType, RewardEpochDelegatedStakes},
         bank::{
@@ -107,7 +108,7 @@ use {
     solana_accounts_db::{
         account_locks::validate_account_locks,
         account_storage_entry::AccountStorageEntry,
-        accounts::{AccountAddressFilter, Accounts},
+        accounts::{AccountAddressFilter, Accounts, LARGE_STORE_NUM_ACCOUNTS},
         accounts_db::{AccountsDb, AccountsDbConfig},
         accounts_hash::AccountsLtHash,
         accounts_index::IndexKey,
@@ -5019,6 +5020,9 @@ impl Bank {
                 )
             })
         });
+        if accounts.len() >= LARGE_STORE_NUM_ACCOUNTS {
+            slot_tail_timing::mark(self.slot(), slot_tail_timing::Event::StoreStakesCacheDone);
+        }
         self.store_accounts_without_stakes_cache(accounts, thread_pool_for_loading_accounts);
         m.stop();
         self.rc
@@ -5027,6 +5031,38 @@ impl Bank {
             .stats
             .stakes_cache_check_and_store_us
             .fetch_add(m.as_us(), Relaxed);
+    }
+
+    pub(crate) fn store_accounts_with_parallel_geyser(
+        &self,
+        accounts: &[(Pubkey, AccountSharedData)],
+        thread_pool: &ThreadPool,
+    ) {
+        assert!(!self.freeze_started());
+        let new_warmup_cooldown_rate_epoch = self.new_warmup_cooldown_rate_epoch();
+        let in_epoch_rewards_period = self.in_epoch_rewards_period();
+        let remove_inactive_stakes = self.feature_set.snapshot().remove_inactive_stakes;
+        for (pubkey, account) in accounts {
+            self.stakes_cache.check_and_store(
+                pubkey,
+                account,
+                new_warmup_cooldown_rate_epoch,
+                in_epoch_rewards_period,
+                remove_inactive_stakes,
+            );
+        }
+        slot_tail_timing::mark(self.slot(), slot_tail_timing::Event::StoreStakesCacheDone);
+        let storable = (self.slot(), accounts);
+        self.update_bank_hash_stats(&storable);
+        self.enqueue_off_chain_accounts_lt_hash_updates(&storable, Some(thread_pool));
+        slot_tail_timing::mark(self.slot(), slot_tail_timing::Event::StoreLtHashEnqueued);
+        self.rc.accounts.store_accounts_with_parallel_notify(
+            self.slot(),
+            accounts,
+            self.bank_id(),
+            &self.ancestors,
+            thread_pool,
+        );
     }
 
     fn store_account_without_stakes_cache(&self, pubkey: &Pubkey, account: &AccountSharedData) {
@@ -5049,6 +5085,9 @@ impl Bank {
             &accounts,
             thread_pool_for_loading_accounts,
         );
+        if accounts.len() >= LARGE_STORE_NUM_ACCOUNTS {
+            slot_tail_timing::mark(self.slot(), slot_tail_timing::Event::StoreLtHashEnqueued);
+        }
         self.rc
             .accounts
             .store_accounts(accounts, self.bank_id(), None, &self.ancestors);

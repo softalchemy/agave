@@ -11,8 +11,8 @@ use {
 };
 
 const RECORDS_LEN: usize = 64;
-const EVENTS_LEN: usize = 23;
-const COUNTERS_LEN: usize = 4;
+const EVENTS_LEN: usize = 29;
+const COUNTERS_LEN: usize = 5;
 const BUSY: u64 = u64::MAX;
 const UNSET: i64 = i64::MIN;
 
@@ -42,12 +42,19 @@ pub enum Event {
     FooterSchedulerWaited,
     FooterAccountsComputed,
     FooterDone,
+    FooterComputeStart,
+    StoreStakesCacheDone,
+    StoreLtHashEnqueued,
+    EntryBatchStart,
+    TicksVerified,
+    PohSpawned,
 }
 
 const TXS_AFTER_FULL: usize = 0;
 const ENTRIES_AFTER_FULL: usize = 1;
 const REPLAY_PASSES_AFTER_FULL: usize = 2;
 const FOOTER_ACCOUNTS: usize = 3;
+const FOOTER_GEYSER_US: usize = 4;
 
 struct Record {
     slot: AtomicU64,
@@ -171,6 +178,14 @@ pub fn mark_max(slot: Slot, event: Event) {
     }
 }
 
+pub fn footer_geyser_notified(slot: Slot, elapsed_ns: u64) {
+    if qn_flags::slot_tail_timing()
+        && let Some(record) = record(slot)
+    {
+        record.counters[FOOTER_GEYSER_US].store(elapsed_ns / 1_000, Relaxed);
+    }
+}
+
 pub fn tx_committed(slot: Slot) {
     if qn_flags::slot_tail_timing()
         && let Some(record) = record(slot)
@@ -243,6 +258,33 @@ pub fn maybe_report(slot: Slot) {
             i64
         ),
         ("footer_done_us", record.relative_us(Event::FooterDone), i64),
+        (
+            "footer_compute_start_us",
+            record.relative_us(Event::FooterComputeStart),
+            i64
+        ),
+        (
+            "store_stakes_cache_done_us",
+            record.relative_us(Event::StoreStakesCacheDone),
+            i64
+        ),
+        (
+            "store_lt_hash_enqueued_us",
+            record.relative_us(Event::StoreLtHashEnqueued),
+            i64
+        ),
+        (
+            "footer_geyser_us",
+            record.counters[FOOTER_GEYSER_US].load(Relaxed) as i64,
+            i64
+        ),
+        (
+            "entry_batch_start_us",
+            record.relative_us(Event::EntryBatchStart),
+            i64
+        ),
+        ("ticks_verified_us", record.relative_us(Event::TicksVerified), i64),
+        ("poh_spawned_us", record.relative_us(Event::PohSpawned), i64),
         (
             "footer_accounts",
             record.counters[FOOTER_ACCOUNTS].load(Relaxed) as i64,
