@@ -100,7 +100,12 @@ use {
     crossbeam_utils::CachePadded,
     log::*,
     partitioned_epoch_rewards::PartitionedRewardsCalculation,
-    rayon::ThreadPool,
+    rayon::{
+        ThreadPool,
+        iter::{
+            IndexedParallelIterator as _, IntoParallelRefIterator as _, ParallelIterator as _,
+        },
+    },
     serde::{Deserialize, Serialize},
     solana_account::{
         Account, AccountSharedData, InheritableAccountFields, ReadableAccount, WritableAccount,
@@ -5033,36 +5038,82 @@ impl Bank {
             .fetch_add(m.as_us(), Relaxed);
     }
 
-    pub(crate) fn store_accounts_with_parallel_geyser(
+    pub(crate) fn store_footer_accounts(
         &self,
         accounts: &[(Pubkey, AccountSharedData)],
         thread_pool: &ThreadPool,
+        parallel_geyser: bool,
+        lt_hash_on_pool: bool,
     ) {
         assert!(!self.freeze_started());
-        let new_warmup_cooldown_rate_epoch = self.new_warmup_cooldown_rate_epoch();
-        let in_epoch_rewards_period = self.in_epoch_rewards_period();
-        let remove_inactive_stakes = self.feature_set.snapshot().remove_inactive_stakes;
-        for (pubkey, account) in accounts {
-            self.stakes_cache.check_and_store(
-                pubkey,
-                account,
-                new_warmup_cooldown_rate_epoch,
-                in_epoch_rewards_period,
-                remove_inactive_stakes,
-            );
-        }
-        slot_tail_timing::mark(self.slot(), slot_tail_timing::Event::StoreStakesCacheDone);
         let storable = (self.slot(), accounts);
-        self.update_bank_hash_stats(&storable);
-        self.enqueue_off_chain_accounts_lt_hash_updates(&storable, Some(thread_pool));
-        slot_tail_timing::mark(self.slot(), slot_tail_timing::Event::StoreLtHashEnqueued);
-        self.rc.accounts.store_accounts_with_parallel_notify(
-            self.slot(),
-            accounts,
-            self.bank_id(),
-            &self.ancestors,
-            thread_pool,
-        );
+        let previous_accounts: Option<Vec<Option<AccountSharedData>>> = lt_hash_on_pool.then(|| {
+            thread_pool.install(|| {
+                accounts
+                    .par_iter()
+                    .map(|(pubkey, _)| {
+                        self.rc
+                            .accounts
+                            .load_with_fixed_root_do_not_populate_read_cache(&self.ancestors, pubkey)
+                            .map(|(account, _slot)| account)
+                    })
+                    .collect()
+            })
+        });
+        thread_pool.in_place_scope(|scope| {
+            if let Some(previous_accounts) = previous_accounts.as_ref() {
+                scope.spawn(move |_| {
+                    let delta = accounts
+                        .par_iter()
+                        .zip(previous_accounts.par_iter())
+                        .fold(LtHash::identity, |mut delta, ((pubkey, account), previous)| {
+                            if let Some(previous) = previous {
+                                delta.mix_out(&AccountsDb::lt_hash_account(previous, pubkey).0);
+                            }
+                            if account.lamports() != 0 {
+                                delta.mix_in(&AccountsDb::lt_hash_account(account, pubkey).0);
+                            }
+                            delta
+                        })
+                        .reduce(LtHash::identity, |mut delta, other| {
+                            delta.mix_in(&other);
+                            delta
+                        });
+                    self.accounts_lt_hash.lock().unwrap().0.mix_in(&delta);
+                });
+            }
+            let new_warmup_cooldown_rate_epoch = self.new_warmup_cooldown_rate_epoch();
+            let in_epoch_rewards_period = self.in_epoch_rewards_period();
+            let remove_inactive_stakes = self.feature_set.snapshot().remove_inactive_stakes;
+            for (pubkey, account) in accounts {
+                self.stakes_cache.check_and_store(
+                    pubkey,
+                    account,
+                    new_warmup_cooldown_rate_epoch,
+                    in_epoch_rewards_period,
+                    remove_inactive_stakes,
+                );
+            }
+            slot_tail_timing::mark(self.slot(), slot_tail_timing::Event::StoreStakesCacheDone);
+            self.update_bank_hash_stats(&storable);
+            if !lt_hash_on_pool {
+                self.enqueue_off_chain_accounts_lt_hash_updates(&storable, Some(thread_pool));
+            }
+            slot_tail_timing::mark(self.slot(), slot_tail_timing::Event::StoreLtHashEnqueued);
+            if parallel_geyser {
+                self.rc.accounts.store_accounts_with_parallel_notify(
+                    self.slot(),
+                    accounts,
+                    self.bank_id(),
+                    &self.ancestors,
+                    thread_pool,
+                );
+            } else {
+                self.rc
+                    .accounts
+                    .store_accounts(storable, self.bank_id(), None, &self.ancestors);
+            }
+        });
     }
 
     fn store_account_without_stakes_cache(&self, pubkey: &Pubkey, account: &AccountSharedData) {

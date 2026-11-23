@@ -11,8 +11,8 @@ use {
 };
 
 const RECORDS_LEN: usize = 64;
-const EVENTS_LEN: usize = 29;
-const COUNTERS_LEN: usize = 5;
+const EVENTS_LEN: usize = 32;
+const COUNTERS_LEN: usize = 7;
 const BUSY: u64 = u64::MAX;
 const UNSET: i64 = i64::MIN;
 
@@ -48,6 +48,9 @@ pub enum Event {
     EntryBatchStart,
     TicksVerified,
     PohSpawned,
+    CertVerifySpawned,
+    FooterComputeEnd,
+    FooterSelfCheckDone,
 }
 
 const TXS_AFTER_FULL: usize = 0;
@@ -55,6 +58,8 @@ const ENTRIES_AFTER_FULL: usize = 1;
 const REPLAY_PASSES_AFTER_FULL: usize = 2;
 const FOOTER_ACCOUNTS: usize = 3;
 const FOOTER_GEYSER_US: usize = 4;
+const CERT_VERIFY_MAX_US: usize = 5;
+const LT_HASH_FINISH_US: usize = 6;
 
 struct Record {
     slot: AtomicU64,
@@ -178,6 +183,32 @@ pub fn mark_max(slot: Slot, event: Event) {
     }
 }
 
+pub fn mark_first(slot: Slot, event: Event) {
+    if qn_flags::slot_tail_timing()
+        && let Some(record) = record(slot)
+        && record.get(event) == 0
+    {
+        record.set_first(event, now());
+    }
+}
+
+pub fn cert_verified(slot: Slot, verify_start: u64) {
+    if verify_start != 0
+        && let Some(record) = record(slot)
+    {
+        record.counters[CERT_VERIFY_MAX_US]
+            .fetch_max(now().saturating_sub(verify_start) / 1_000, Relaxed);
+    }
+}
+
+pub fn lt_hash_finished(slot: Slot, elapsed_us: u64) {
+    if qn_flags::slot_tail_timing()
+        && let Some(record) = record(slot)
+    {
+        record.counters[LT_HASH_FINISH_US].store(elapsed_us, Relaxed);
+    }
+}
+
 pub fn footer_geyser_notified(slot: Slot, elapsed_ns: u64) {
     if qn_flags::slot_tail_timing()
         && let Some(record) = record(slot)
@@ -261,6 +292,31 @@ pub fn maybe_report(slot: Slot) {
         (
             "footer_compute_start_us",
             record.relative_us(Event::FooterComputeStart),
+            i64
+        ),
+        (
+            "footer_compute_end_us",
+            record.relative_us(Event::FooterComputeEnd),
+            i64
+        ),
+        (
+            "footer_self_check_done_us",
+            record.relative_us(Event::FooterSelfCheckDone),
+            i64
+        ),
+        (
+            "cert_verify_spawned_us",
+            record.relative_us(Event::CertVerifySpawned),
+            i64
+        ),
+        (
+            "cert_verify_max_us",
+            record.counters[CERT_VERIFY_MAX_US].load(Relaxed) as i64,
+            i64
+        ),
+        (
+            "lt_hash_finish_us",
+            record.counters[LT_HASH_FINISH_US].load(Relaxed) as i64,
             i64
         ),
         (

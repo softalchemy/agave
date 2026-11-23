@@ -415,8 +415,10 @@ impl ValidatedBlockFinalizationCert {
         cert: UnverifiedCertificate,
     ) -> Result<CertSignature, BlockFinalizationCertError> {
         let cert_type = cert.cert_type;
-        let cert = bank
-            .verify_certificate(cert, None)
+        let verify_start = crate::slot_tail_timing::now_if_enabled();
+        let cert = bank.verify_certificate(cert, crate::qn_flags::footer_cert_aggregate_pool());
+        crate::slot_tail_timing::cert_verified(bank.slot(), verify_start);
+        let cert = cert
             .map_err(|_| BlockFinalizationCertError::CertificateVerificationFailed(cert_type))?;
         debug_assert_eq!(cert.cert_type, cert_type);
         Ok(CertSignature {

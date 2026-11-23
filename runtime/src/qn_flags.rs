@@ -52,6 +52,12 @@ static FOOTER_REWARDS_PARALLEL: LazyLock<bool> =
     LazyLock::new(|| enabled("AGAVE_FOOTER_REWARDS_PARALLEL"));
 static FOOTER_GEYSER_ACCOUNTS_DEFERRED: LazyLock<bool> =
     LazyLock::new(|| enabled("AGAVE_FOOTER_GEYSER_ACCOUNTS_DEFERRED"));
+static FOOTER_CERT_VERIFY_EARLY: LazyLock<bool> =
+    LazyLock::new(|| enabled("AGAVE_FOOTER_CERT_VERIFY_EARLY"));
+static FOOTER_CERT_AGGREGATE_PARALLEL: LazyLock<bool> =
+    LazyLock::new(|| enabled("AGAVE_FOOTER_CERT_AGGREGATE_PARALLEL"));
+static FOOTER_LT_HASH_ON_POOL: LazyLock<bool> =
+    LazyLock::new(|| enabled("AGAVE_FOOTER_LT_HASH_ON_POOL"));
 static FOOTER_SELF_CHECK: LazyLock<bool> = LazyLock::new(|| enabled("AGAVE_FOOTER_SELF_CHECK"));
 static REPLAY_REFETCH_AFTER_FOOTER: LazyLock<bool> =
     LazyLock::new(|| enabled("AGAVE_REPLAY_REFETCH_AFTER_FOOTER"));
@@ -75,6 +81,18 @@ pub fn footer_geyser_accounts_deferred() -> bool {
     *FOOTER_GEYSER_ACCOUNTS_DEFERRED
 }
 
+pub fn footer_cert_verify_early() -> bool {
+    *FOOTER_CERT_VERIFY_EARLY
+}
+
+pub fn footer_cert_aggregate_pool() -> Option<&'static ThreadPool> {
+    FOOTER_CERT_AGGREGATE_PARALLEL.then(footer_pool)
+}
+
+pub fn footer_lt_hash_on_pool() -> bool {
+    *FOOTER_LT_HASH_ON_POOL
+}
+
 pub fn footer_self_check() -> bool {
     *FOOTER_SELF_CHECK
 }
@@ -92,7 +110,7 @@ static FOOTER_POOL: LazyLock<ThreadPool> = LazyLock::new(|| {
         .ok()
         .and_then(|value| value.parse().ok())
         .filter(|num_threads| *num_threads > 0)
-        .unwrap_or(4);
+        .unwrap_or(8);
     rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads)
         .thread_name(|i| format!("solFooterWrk{i:02}"))
@@ -163,6 +181,9 @@ pub fn log_flags() {
         || footer_rewards_overlap()
         || footer_rewards_parallel()
         || footer_geyser_accounts_deferred()
+        || footer_cert_verify_early()
+        || footer_cert_aggregate_pool().is_some()
+        || footer_lt_hash_on_pool()
     {
         info!(
             "qn footer pool threads={}",
@@ -171,13 +192,17 @@ pub fn log_flags() {
     }
     info!(
         "qn footer flags: rewards_overlap={} rewards_parallel={} geyser_accounts_deferred={} \
-         self_check={} replay_refetch_after_footer={} geyser_processed_at_footer={}",
+         self_check={} replay_refetch_after_footer={} geyser_processed_at_footer={} \
+         cert_verify_early={} cert_aggregate_parallel={} lt_hash_on_pool={}",
         footer_rewards_overlap(),
         footer_rewards_parallel(),
         footer_geyser_accounts_deferred(),
         footer_self_check(),
         replay_refetch_after_footer(),
         geyser_processed_at_footer(),
+        footer_cert_verify_early(),
+        footer_cert_aggregate_pool().is_some(),
+        footer_lt_hash_on_pool(),
     );
     info!(
         "qn flags: geyser_tx_notify_inline={} geyser_processed_inline={} \

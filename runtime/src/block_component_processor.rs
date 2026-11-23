@@ -614,7 +614,10 @@ impl BlockComponentProcessor {
 
         Self::enforce_nanosecond_clock_bounds(bank, &parent_bank, &footer)?;
 
-        if qn_flags::footer_rewards_overlap() || qn_flags::geyser_processed_at_footer() {
+        if qn_flags::footer_rewards_overlap()
+            || qn_flags::geyser_processed_at_footer()
+            || qn_flags::footer_cert_verify_early()
+        {
             return Self::on_footer_scheduler_first(
                 my_pubkey,
                 bank,
@@ -742,43 +745,9 @@ impl BlockComponentProcessor {
             notar_reward_cert,
         } = footer;
 
-        let scheduler_result = bank
-            .wait_for_completed_scheduler()
-            .map(|(result, execute_time)| {
-                execute_timings.accumulate(&execute_time);
-                result
-            });
-        slot_tail_timing::mark(bank.slot(), Event::FooterSchedulerWaited);
-        let scheduler_ok = matches!(scheduler_result, Some(Ok(())));
-        if scheduler_ok && bank.parent().is_some() {
-            qn_flags::notify_processed_at_footer(bank.slot(), bank.parent_slot(), bank.bank_id());
-        }
-
         let verify_bank: &Bank = bank;
         let block_producer_time_nanos =
             Self::block_producer_time_nanos_as_i64(block_producer_time_nanos);
-        let speculative_inputs = match &block_producer_time_nanos {
-            Ok(time_nanos) if qn_flags::footer_rewards_overlap() && scheduler_ok => {
-                let reward_cert = ValidatedRewardCert::speculative(
-                    verify_bank,
-                    &skip_reward_cert,
-                    &notar_reward_cert,
-                );
-                let final_cert_input = match &block_final_cert {
-                    None => Some(None),
-                    Some(cert) => {
-                        ValidatedBlockFinalizationCert::speculative_signers(cert, verify_bank)
-                            .map(Some)
-                    }
-                };
-                reward_cert
-                    .zip(final_cert_input)
-                    .map(|(reward_cert, final_cert_input)| {
-                        (reward_cert, final_cert_input, *time_nanos)
-                    })
-            }
-            _ => None,
-        };
 
         let verify_certs = || {
             let verify_reward_cert = || {
@@ -810,33 +779,87 @@ impl BlockComponentProcessor {
             slot_tail_timing::mark(verify_bank.slot(), Event::FooterCertsVerified);
             certs
         };
-        let ((reward_cert, final_cert), speculative) = match speculative_inputs {
-            Some((speculative_reward_cert, speculative_final_cert_input, time_nanos)) => {
-                let compute = || {
-                    let accounts = compute_vote_reward_accounts(
-                        verify_bank,
-                        &speculative_reward_cert,
-                        speculative_final_cert_input
-                            .as_ref()
-                            .map(|(signers, slot)| (signers, *slot)),
-                        time_nanos,
-                        qn_flags::footer_rewards_parallel(),
-                    );
-                    slot_tail_timing::mark(verify_bank.slot(), Event::FooterAccountsComputed);
-                    accounts
+        let ((reward_cert, final_cert), scheduler_result, speculative) = qn_flags::footer_pool()
+            .in_place_scope(|scope| {
+                let (certs_sender, certs_receiver) = std::sync::mpsc::sync_channel(1);
+                let spawn_verify_certs = || {
+                    slot_tail_timing::mark(verify_bank.slot(), Event::CertVerifySpawned);
+                    scope.spawn(move |_| {
+                        let _ = certs_sender.send(verify_certs());
+                    });
                 };
-                let (certs, accounts) = qn_flags::join(verify_certs, compute);
-                (
-                    certs,
-                    Some((
-                        speculative_reward_cert,
-                        speculative_final_cert_input,
-                        accounts,
-                    )),
-                )
-            }
-            None => (verify_certs(), None),
-        };
+                let mut spawn_verify_certs = Some(spawn_verify_certs);
+                if qn_flags::footer_cert_verify_early()
+                    && let Some(spawn_verify_certs) = spawn_verify_certs.take()
+                {
+                    spawn_verify_certs();
+                }
+
+                let scheduler_result =
+                    bank.wait_for_completed_scheduler()
+                        .map(|(result, execute_time)| {
+                            execute_timings.accumulate(&execute_time);
+                            result
+                        });
+                slot_tail_timing::mark(verify_bank.slot(), Event::FooterSchedulerWaited);
+                let scheduler_ok = matches!(scheduler_result, Some(Ok(())));
+                if scheduler_ok && verify_bank.parent().is_some() {
+                    qn_flags::notify_processed_at_footer(
+                        verify_bank.slot(),
+                        verify_bank.parent_slot(),
+                        verify_bank.bank_id(),
+                    );
+                }
+                if let Some(spawn_verify_certs) = spawn_verify_certs.take() {
+                    spawn_verify_certs();
+                }
+
+                let speculative_inputs = match &block_producer_time_nanos {
+                    Ok(time_nanos) if qn_flags::footer_rewards_overlap() && scheduler_ok => {
+                        let reward_cert = ValidatedRewardCert::speculative(
+                            verify_bank,
+                            &skip_reward_cert,
+                            &notar_reward_cert,
+                        );
+                        let final_cert_input = match &block_final_cert {
+                            None => Some(None),
+                            Some(cert) => ValidatedBlockFinalizationCert::speculative_signers(
+                                cert,
+                                verify_bank,
+                            )
+                            .map(Some),
+                        };
+                        reward_cert
+                            .zip(final_cert_input)
+                            .map(|(reward_cert, final_cert_input)| {
+                                (reward_cert, final_cert_input, *time_nanos)
+                            })
+                    }
+                    _ => None,
+                };
+                let speculative = speculative_inputs.map(
+                    |(speculative_reward_cert, speculative_final_cert_input, time_nanos)| {
+                        let accounts = compute_vote_reward_accounts(
+                            verify_bank,
+                            &speculative_reward_cert,
+                            speculative_final_cert_input
+                                .as_ref()
+                                .map(|(signers, slot)| (signers, *slot)),
+                            time_nanos,
+                            qn_flags::footer_rewards_parallel(),
+                        );
+                        (
+                            speculative_reward_cert,
+                            speculative_final_cert_input,
+                            accounts,
+                        )
+                    },
+                );
+                let certs = certs_receiver
+                    .recv()
+                    .expect("footer certificate verification result");
+                (certs, scheduler_result, speculative)
+            });
         let reward_cert = reward_cert?;
         let block_producer_time_nanos = block_producer_time_nanos?;
         let final_cert = final_cert?;
@@ -889,7 +912,10 @@ impl BlockComponentProcessor {
             None => compute(qn_flags::footer_rewards_parallel())?,
         };
         let updated_accounts = if qn_flags::footer_self_check() {
-            Self::footer_self_check(bank.slot(), updated_accounts, compute(false)?)
+            let checked =
+                Self::footer_self_check(bank.slot(), updated_accounts, compute(false)?);
+            slot_tail_timing::mark(bank.slot(), Event::FooterSelfCheckDone);
+            checked
         } else {
             updated_accounts
         };

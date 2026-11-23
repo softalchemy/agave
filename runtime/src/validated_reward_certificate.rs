@@ -105,7 +105,8 @@ impl ValidatedRewardCert {
                 if let Some(skip) = skip {
                     let vote = Vote::new_skip_vote(skip.slot);
                     let payload = get_vote_payload_to_sign(vote, shred_version);
-                    verify_base2(
+                    let verify_start = crate::slot_tail_timing::now_if_enabled();
+                    let result = verify_base2(
                         &payload,
                         &skip.signature,
                         skip.to_bitmap(),
@@ -116,8 +117,10 @@ impl ValidatedRewardCert {
                                 entry.bls_pubkey
                             })
                         },
-                        None,
-                    )?
+                        crate::qn_flags::footer_cert_aggregate_pool(),
+                    );
+                    crate::slot_tail_timing::cert_verified(bank.slot(), verify_start);
+                    result?
                 }
                 Ok::<_, Error>(signers)
             };
@@ -129,7 +132,8 @@ impl ValidatedRewardCert {
                         block_id: notar.block_id,
                     });
                     let payload = get_vote_payload_to_sign(vote, shred_version);
-                    verify_base2(
+                    let verify_start = crate::slot_tail_timing::now_if_enabled();
+                    let result = verify_base2(
                         &payload,
                         &notar.signature,
                         notar.bitmap(),
@@ -140,8 +144,10 @@ impl ValidatedRewardCert {
                                 entry.bls_pubkey
                             })
                         },
-                        None,
-                    )?
+                        crate::qn_flags::footer_cert_aggregate_pool(),
+                    );
+                    crate::slot_tail_timing::cert_verified(bank.slot(), verify_start);
+                    result?
                 }
                 Ok::<_, Error>(signers)
             };

@@ -462,8 +462,13 @@ pub(super) fn store_vote_reward_accounts(
     updated_accounts: Vec<(Pubkey, AccountSharedData)>,
 ) {
     slot_tail_timing::footer_accounts(bank.slot(), updated_accounts.len());
-    if qn_flags::footer_geyser_accounts_deferred() {
-        bank.store_accounts_with_parallel_geyser(&updated_accounts, qn_flags::footer_pool());
+    if qn_flags::footer_geyser_accounts_deferred() || qn_flags::footer_lt_hash_on_pool() {
+        bank.store_footer_accounts(
+            &updated_accounts,
+            qn_flags::footer_pool(),
+            qn_flags::footer_geyser_accounts_deferred(),
+            qn_flags::footer_lt_hash_on_pool(),
+        );
     } else {
         bank.store_accounts(
             (bank.slot(), updated_accounts.as_slice()),
@@ -485,7 +490,7 @@ pub(super) fn compute_vote_reward_accounts(
     block_producer_time_nanos: i64,
     parallel: bool,
 ) -> Result<Option<Vec<(Pubkey, AccountSharedData)>>, CalcVoteRewardUpdateVoteStatesError> {
-    slot_tail_timing::mark(bank.slot(), slot_tail_timing::Event::FooterComputeStart);
+    slot_tail_timing::mark_first(bank.slot(), slot_tail_timing::Event::FooterComputeStart);
     let Some(updated_accounts) = allocate_updated_accounts(bank, reward_cert, &final_cert_input)?
     else {
         return Ok(None);
@@ -532,6 +537,7 @@ pub(super) fn compute_vote_reward_accounts(
         )?,
     };
 
+    slot_tail_timing::mark_first(bank.slot(), slot_tail_timing::Event::FooterComputeEnd);
     Ok(Some(updated_accounts))
 }
 
