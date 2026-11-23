@@ -55,6 +55,13 @@ static ACCOUNT_PREFETCH_POOL: LazyLock<ThreadPool> = LazyLock::new(|| {
         .unwrap()
 });
 
+static REPLAY_ENTRIES_FAST_PATH: LazyLock<bool> =
+    LazyLock::new(|| enabled("AGAVE_REPLAY_ENTRIES_FAST_PATH"));
+
+pub fn replay_entries_fast_path() -> bool {
+    *REPLAY_ENTRIES_FAST_PATH
+}
+
 pub fn geyser_tx_notify_before_commit() -> bool {
     *GEYSER_TX_NOTIFY_BEFORE_COMMIT
 }
@@ -301,7 +308,7 @@ pub fn log_flags() {
     );
     info!(
         "qn exec flags: geyser_tx_notify_before_commit={} replay_account_prefetch={} \
-         replay_account_prefetch_threads={}",
+         replay_account_prefetch_threads={} replay_entries_fast_path={}",
         geyser_tx_notify_before_commit(),
         replay_account_prefetch(),
         if replay_account_prefetch() {
@@ -309,5 +316,6 @@ pub fn log_flags() {
         } else {
             0
         },
+        replay_entries_fast_path(),
     );
 }

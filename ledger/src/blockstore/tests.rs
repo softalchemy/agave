@@ -2588,6 +2588,38 @@ fn test_iter_bounds() {
 }
 
 #[test]
+fn test_fast_path_ranges() {
+    let completed: CompletedDataIndexes = [2, 4, 9, 11].iter().copied().collect();
+    let ranges = |old_consumed, consumed, last_index| {
+        Blockstore::fast_path_ranges(&completed, old_consumed, consumed, last_index)
+    };
+    assert_eq!(ranges(0, 1, None), (vec![], 0));
+    assert_eq!(ranges(0, 3, None), (vec![0..3], 3));
+    assert_eq!(ranges(1, 3, None), (vec![0..3], 3));
+    assert_eq!(ranges(3, 5, None), (vec![3..5], 5));
+    assert_eq!(ranges(4, 5, None), (vec![3..5], 5));
+    assert_eq!(ranges(1, 10, None), (vec![0..3, 3..5, 5..10], 10));
+    assert_eq!(ranges(5, 8, None), (vec![], 5));
+    assert_eq!(ranges(7, 10, None), (vec![5..10], 10));
+    assert_eq!(ranges(10, 10, None), (vec![], 10));
+    assert_eq!(ranges(10, 12, None), (vec![10..12], 12));
+    assert_eq!(ranges(10, 12, Some(11)), (vec![], 12));
+    assert_eq!(ranges(3, 12, Some(11)), (vec![3..5, 5..10], 12));
+    assert_eq!(ranges(0, 12, Some(11)), (vec![0..3, 3..5, 5..10], 12));
+    assert_eq!(ranges(0, 12, Some(20)), (vec![0..3, 3..5, 5..10, 10..12], 12));
+    let valid = |consumed: &u32| !completed.contains(consumed);
+    for old_consumed in (0..=12).filter(valid) {
+        for consumed in (old_consumed..=12).filter(valid) {
+            let (fast, end) = ranges(old_consumed, consumed, None);
+            let before = Blockstore::get_completed_data_ranges(0, &completed, old_consumed);
+            let after = Blockstore::get_completed_data_ranges(0, &completed, consumed);
+            assert_eq!(after[before.len()..], fast[..]);
+            assert_eq!(end, after.last().map_or(0, |range| range.end));
+        }
+    }
+}
+
+#[test]
 fn test_get_completed_data_ranges() {
     let completed_data_end_indexes = [2, 4, 9, 11].iter().copied().collect();
 

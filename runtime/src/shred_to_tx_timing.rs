@@ -25,13 +25,16 @@ const SHREDS_LEN: usize = 1 << 16;
 const FECS_LEN: usize = 1 << 13;
 const RECORDS_LEN: usize = 16;
 const SETS_LEN: usize = 512;
-const STAMPS_LEN: usize = 15;
+const STAMPS_LEN: usize = 16;
+const INSERT_PARTS_LEN: usize = 10;
 const MAX_SET_SHREDS: u32 = 4096;
 const BUSY: u64 = u64::MAX;
 const UNSET: i64 = i64::MIN;
 const REPORT_AFTER_FROZEN: u64 = 300_000_000;
 const REPORT_AFTER_CREATED: u64 = 10_000_000_000;
 const FLAG_RECOVERED: u32 = 1;
+const FLAG_PUBLISHED: u32 = 2;
+const FLAG_FAST: u32 = 4;
 
 #[derive(Clone, Copy)]
 #[repr(usize)]
@@ -51,6 +54,22 @@ enum Stamp {
     LastCommit,
     FirstNotify,
     LastNotify,
+    Committed,
+}
+
+#[derive(Clone, Copy)]
+#[repr(usize)]
+pub enum InsertPart {
+    Lock,
+    Shreds,
+    Recovery,
+    Publish,
+    Chaining,
+    Merkle,
+    CommitMeta,
+    Write,
+    Signal,
+    BatchShreds,
 }
 
 struct ShredEntry {
@@ -102,6 +121,7 @@ struct SetRecord {
     tx_end: AtomicU32,
     fec_first: AtomicU64,
     stamps: [AtomicU64; STAMPS_LEN],
+    insert_parts: [AtomicU64; INSERT_PARTS_LEN],
 }
 
 impl SetRecord {
@@ -113,6 +133,7 @@ impl SetRecord {
             tx_end: AtomicU32::new(0),
             fec_first: AtomicU64::new(0),
             stamps: [const { AtomicU64::new(0) }; STAMPS_LEN],
+            insert_parts: [const { AtomicU64::new(0) }; INSERT_PARTS_LEN],
         }
     }
 
@@ -226,6 +247,9 @@ static REPORT_EVERY: LazyLock<u64> = LazyLock::new(|| {
 thread_local! {
     static WINDOW_DEQUEUED: Cell<u64> = const { Cell::new(0) };
     static CURRENT_SET: Cell<Option<(Slot, usize)>> = const { Cell::new(None) };
+    static INSERT_MARK: Cell<u64> = const { Cell::new(0) };
+    static INSERT_COMMITTED: Cell<u64> = const { Cell::new(0) };
+    static INSERT_PARTS: Cell<[u64; INSERT_PARTS_LEN]> = const { Cell::new([0; INSERT_PARTS_LEN]) };
 }
 
 fn enabled() -> bool {
@@ -419,6 +443,67 @@ pub fn recovered(slot: Slot, index: u32, fec_set_index: u32) {
     entry.key.store(key, Relaxed);
 }
 
+pub fn insert_begin() {
+    if enabled() {
+        INSERT_MARK.set(now());
+        INSERT_COMMITTED.set(0);
+        INSERT_PARTS.set([0; INSERT_PARTS_LEN]);
+    }
+}
+
+pub fn insert_mark(part: InsertPart) {
+    if !enabled() {
+        return;
+    }
+    let now = now();
+    let last = INSERT_MARK.replace(now);
+    if last == 0 {
+        return;
+    }
+    let mut parts = INSERT_PARTS.get();
+    parts[part as usize] += now.saturating_sub(last);
+    INSERT_PARTS.set(parts);
+    if matches!(part, InsertPart::Write) {
+        INSERT_COMMITTED.set(now);
+    }
+}
+
+pub fn insert_count(num_shreds: usize) {
+    if enabled() {
+        let mut parts = INSERT_PARTS.get();
+        parts[InsertPart::BatchShreds as usize] = num_shreds as u64;
+        INSERT_PARTS.set(parts);
+    }
+}
+
+pub fn insert_finished(sets: impl Iterator<Item = (Slot, u32)>) {
+    insert_mark(InsertPart::Signal);
+    let parts = INSERT_PARTS.get();
+    let committed = INSERT_COMMITTED.get();
+    for (slot, end) in sets {
+        if let Some(record) = record(slot)
+            && let Some((_, set)) = record.set_by_end(end)
+        {
+            for (target, value) in set.insert_parts.iter().zip(parts) {
+                target.store(value, Relaxed);
+            }
+            set.set(Stamp::Committed, committed);
+        }
+    }
+    INSERT_MARK.set(0);
+}
+
+pub fn data_set_published(slot: Slot, indices: Range<u32>, insert_start: u64, published: u64) {
+    let end = indices.end;
+    data_set_completed(slot, indices, insert_start, published);
+    if let Some(record) = record(slot)
+        && let Some((_, set)) = record.set_by_end(end)
+    {
+        set.flags.fetch_or(FLAG_PUBLISHED, Relaxed);
+        set.set(Stamp::Available, published);
+    }
+}
+
 pub fn data_set_completed(slot: Slot, indices: Range<u32>, insert_start: u64, insert_done: u64) {
     let Some(record) = claim(slot) else {
         return;
@@ -444,6 +529,9 @@ pub fn data_set_completed(slot: Slot, indices: Range<u32>, insert_start: u64, in
         .any(|entry| entry.recv.load(Relaxed) & INGRESS_MASK == INGRESS_RECOVERED);
     let set = &record.sets[index];
     set.stamps.iter().for_each(|stamp| stamp.store(0, Relaxed));
+    set.insert_parts
+        .iter()
+        .for_each(|part| part.store(0, Relaxed));
     set.end.store(indices.end, Relaxed);
     set.tx_start.store(0, Relaxed);
     set.tx_end.store(0, Relaxed);
@@ -486,7 +574,7 @@ pub fn replay_pass() {
     }
 }
 
-pub fn fetched(slot: Slot, completed_ranges: &[Range<u32>]) {
+pub fn fetched(slot: Slot, completed_ranges: &[Range<u32>], fast: bool) {
     if !enabled() || completed_ranges.is_empty() {
         return;
     }
@@ -502,6 +590,9 @@ pub fn fetched(slot: Slot, completed_ranges: &[Range<u32>]) {
         if let Some((_, set)) = record.set_by_end(range.end) {
             set.set(Stamp::Wakeup, pass_start.max(set.get(Stamp::Available)));
             set.set(Stamp::Fetched, now);
+            if fast {
+                set.flags.fetch_or(FLAG_FAST, Relaxed);
+            }
         }
     }
 }
@@ -596,7 +687,24 @@ macro_rules! names {
     };
 }
 
-const STAGES: [([&str; 4], Stamp, Stamp); 15] = [
+const INSERT_PART_NAMES: [[&str; 4]; INSERT_PARTS_LEN] = [
+    names!("ins_lock"),
+    names!("ins_shreds"),
+    names!("ins_recovery"),
+    names!("ins_publish"),
+    names!("ins_chaining"),
+    names!("ins_merkle"),
+    names!("ins_commit_meta"),
+    names!("ins_write"),
+    names!("ins_signal"),
+    [
+        "ins_batch_shreds_min",
+        "ins_batch_shreds_p50",
+        "ins_batch_shreds_p90",
+        "ins_batch_shreds_max",
+    ],
+];
+const STAGES: [([&str; 4], Stamp, Stamp); 16] = [
     (names!("recv_to_pktmod"), Stamp::Recv, Stamp::PktMod),
     (names!("pktmod_to_sigverify"), Stamp::PktMod, Stamp::SvIn),
     (names!("sigverify"), Stamp::SvIn, Stamp::SvOut),
@@ -624,6 +732,11 @@ const STAGES: [([&str; 4], Stamp, Stamp); 15] = [
     (names!("recv_to_insert"), Stamp::Recv, Stamp::InsertDone),
     (names!("recv_to_scheduled"), Stamp::Recv, Stamp::Scheduled),
     (names!("recv_to_first_notify"), Stamp::Recv, Stamp::FirstNotify),
+    (
+        names!("insert_to_commit"),
+        Stamp::InsertDone,
+        Stamp::Committed,
+    ),
 ];
 const RECV_TO_LAST_NOTIFY: [&str; 4] = names!("recv_to_last_notify");
 const AVAILABLE_TO_WAKEUP: [&str; 4] = names!("available_to_wakeup");
@@ -661,7 +774,7 @@ fn build_report(record: &SlotRecord, slot: Slot) -> Vec<(&'static str, i64)> {
     let is_recovered = |set: &&SetRecord| set.flags.load(Relaxed) & FLAG_RECOVERED != 0;
     let tx_sets: Vec<&SetRecord> = sets.iter().filter(has_txs).collect();
     let first_pass = record.first_pass.load(Relaxed);
-    let mut fields = Vec::with_capacity(112);
+    let mut fields = Vec::with_capacity(160);
     fields.push(("slot", slot as i64));
     fields.push(("frozen", (record.frozen.load(Relaxed) != 0) as i64));
     fields.push(("sets", sets.len() as i64));
@@ -691,6 +804,24 @@ fn build_report(record: &SlotRecord, slot: Slot) -> Vec<(&'static str, i64)> {
         tx_sets.iter().copied().filter(is_recovered).count() as i64,
     ));
     fields.push(("sets_dropped", record.dropped.load(Relaxed) as i64));
+    for (name, flag) in [
+        ("sets_published", FLAG_PUBLISHED),
+        ("sets_fast", FLAG_FAST),
+    ] {
+        fields.push((
+            name,
+            sets.iter()
+                .filter(|set| set.flags.load(Relaxed) & flag != 0)
+                .count() as i64,
+        ));
+    }
+    fields.push((
+        "sets_tx_fast",
+        tx_sets
+            .iter()
+            .filter(|set| set.flags.load(Relaxed) & FLAG_FAST != 0)
+            .count() as i64,
+    ));
     fields.push((
         "txs",
         tx_sets
@@ -705,6 +836,19 @@ fn build_report(record: &SlotRecord, slot: Slot) -> Vec<(&'static str, i64)> {
         let values = tx_sets
             .iter()
             .filter_map(|set| set.delta_us(from, to))
+            .collect();
+        push_stats(&mut fields, names, values);
+    }
+    for (index, names) in INSERT_PART_NAMES.into_iter().enumerate() {
+        let divisor = if index == InsertPart::BatchShreds as usize {
+            1
+        } else {
+            1_000
+        };
+        let values = tx_sets
+            .iter()
+            .filter(|set| set.get(Stamp::Committed) != 0)
+            .map(|set| set.insert_parts[index].load(Relaxed) as i64 / divisor)
             .collect();
         push_stats(&mut fields, names, values);
     }
@@ -819,6 +963,59 @@ pub fn start() {
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_insert_parts_and_fast_sets() {
+        let slot = 920_000_000 + 5;
+        let pause = || std::thread::sleep(Duration::from_micros(300));
+        insert_begin();
+        pause();
+        insert_mark(InsertPart::Lock);
+        insert_count(7);
+        let insert_start = now();
+        pause();
+        insert_mark(InsertPart::Shreds);
+        insert_mark(InsertPart::Recovery);
+        data_set_published(slot, 0..32, insert_start, now());
+        insert_mark(InsertPart::Publish);
+        fetched(slot, &[0..32], true);
+        entry_batch(slot, 32, 0, 2);
+        pause();
+        insert_mark(InsertPart::Chaining);
+        insert_mark(InsertPart::Merkle);
+        insert_mark(InsertPart::CommitMeta);
+        pause();
+        insert_mark(InsertPart::Write);
+        data_set_completed(slot, 32..64, insert_start, now());
+        consumed(slot, 64, now());
+        insert_finished([(slot, 32), (slot, 64)].into_iter());
+        fetched(slot, &[32..64], false);
+        entry_batch(slot, 64, 2, 1);
+
+        let fields = build_report(record(slot).unwrap(), slot);
+        let field = |name: &str| {
+            fields
+                .iter()
+                .find(|(field, _)| *field == name)
+                .map(|(_, value)| *value)
+                .unwrap()
+        };
+        assert_eq!(field("sets"), 2);
+        assert_eq!(field("sets_tx"), 2);
+        assert_eq!(field("sets_published"), 1);
+        assert_eq!(field("sets_fast"), 1);
+        assert_eq!(field("sets_tx_fast"), 1);
+        assert!(field("ins_lock_min_us") >= 300);
+        assert!(field("ins_shreds_min_us") >= 300);
+        assert!(field("ins_chaining_min_us") >= 300);
+        assert!(field("ins_write_min_us") >= 300);
+        assert!(field("ins_recovery_max_us") < 300);
+        assert_eq!(field("ins_batch_shreds_p50"), 7);
+        assert!(field("insert_to_commit_max_us") >= 600);
+        assert!(field("insert_to_commit_min_us") <= 0);
+        assert!(field("insert_min_us") >= 300);
+        assert!(field("insert_max_us") >= 900);
+    }
+
     fn field(fields: &[(&'static str, i64)], name: &str) -> i64 {
         fields
             .iter()
@@ -838,7 +1035,7 @@ mod tests {
         data_set_completed(slot, 0..32, start, start);
         consumed(slot, 32, start);
         replay_pass();
-        fetched(slot, &[0..32]);
+        fetched(slot, &[0..32], false);
         entry_batch(slot, 32, 0, 0);
         for index in 32..64 {
             received(slot, index, true, 32, 32, INGRESS_TURBINE, now());
@@ -864,7 +1061,7 @@ mod tests {
         pause();
         replay_pass();
         pause();
-        fetched(slot, &[32..64]);
+        fetched(slot, &[32..64], false);
         entry_batch(slot, 64, 0, 3);
         pause();
         scheduled(slot);
@@ -890,6 +1087,8 @@ mod tests {
         for (names, _, _) in STAGES {
             if names[1] == "insert_to_available_p50_us" {
                 assert_eq!(field(&fields, names[1]), 0);
+            } else if names[1] == "insert_to_commit_p50_us" {
+                assert_eq!(field(&fields, names[1]), UNSET);
             } else {
                 assert!(field(&fields, names[1]) >= 200, "{}", names[1]);
             }
@@ -935,7 +1134,7 @@ mod tests {
         consumed(slot, 64, insert_done);
         pause();
         replay_pass();
-        fetched(slot, &[0..32, 32..64]);
+        fetched(slot, &[0..32, 32..64], false);
         entry_batch(slot, 32, 0, 0);
         scheduled(slot);
         entry_batch(slot, 64, 0, 2);

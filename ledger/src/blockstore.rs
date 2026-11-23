@@ -59,7 +59,9 @@ use {
     solana_measure::{measure::Measure, measure_us},
     solana_metrics::datapoint_error,
     solana_pubkey::Pubkey,
-    solana_runtime::{bank::Bank, leader_schedule_utils::leader_slot_index},
+    solana_runtime::{
+        bank::Bank, leader_schedule_utils::leader_slot_index, shred_to_tx_timing::InsertPart,
+    },
     solana_runtime_transaction::sanitize_config::sanitize_config,
     solana_sha256_hasher::hashv,
     solana_signature::Signature,
@@ -431,6 +433,7 @@ pub struct Blockstore {
 
     max_root: AtomicU64,
     insert_shreds_lock: Mutex<()>,
+    fast_path: Mutex<FastPath>,
     switch_block_lock: SwitchBlockLock,
     new_shreds_signals: Mutex<Vec<Sender<bool>>>,
     completed_slots_senders: Mutex<Vec<CompletedSlotsSender>>,
@@ -470,6 +473,28 @@ pub struct SlotMetaWorkingSetEntry {
     /// True only if at least one shred for this SlotMeta was inserted since
     /// this struct was created.
     did_insert_occur: bool,
+}
+
+struct FastComponent {
+    slot: Slot,
+    range: Range<u32>,
+    payload: Vec<u8>,
+}
+
+#[derive(Default)]
+struct FastPath {
+    published: Vec<FastComponent>,
+    dead_in_batch: Vec<Slot>,
+}
+
+struct FastPublishGuard<'a>(&'a Mutex<FastPath>);
+
+impl Drop for FastPublishGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut fast_path) = self.0.lock() {
+            fast_path.published.clear();
+        }
+    }
 }
 
 struct ShredInsertionTracker<'a, 'batch> {
@@ -795,6 +820,7 @@ impl Blockstore {
             )),
             certificate_forwarder: OnceLock::new(),
             insert_shreds_lock: Mutex::<()>::default(),
+            fast_path: Mutex::default(),
             switch_block_lock: SwitchBlockLock(FairMutex::new(())),
             max_root,
             lowest_cleanup_slot: RwLock::<Slot>::default(),
@@ -1674,6 +1700,9 @@ impl Blockstore {
             .unwrap_or(true);
 
         if mark_slot_dead {
+            if solana_runtime::qn_flags::replay_entries_fast_path() {
+                self.fast_path.lock().unwrap().dead_in_batch.push(slot);
+            }
             // If the slot is already full there is no reason to mark as dead
             self.dead_slots_cf.put_bytes_in_batch(
                 shred_insertion_tracker.write_batch,
@@ -2163,6 +2192,163 @@ impl Blockstore {
         }
     }
 
+    fn publish_fast_components(
+        &self,
+        shred_insertion_tracker: &ShredInsertionTracker,
+    ) -> Vec<(Slot, Range<u32>)> {
+        let mut fast_path = self.fast_path.lock().unwrap();
+        let FastPath {
+            published,
+            dead_in_batch,
+        } = &mut *fast_path;
+        published.clear();
+        let mut ranges = vec![];
+        for ((location, slot), entry) in &shred_insertion_tracker.slot_meta_working_set {
+            if !matches!(location, BlockLocation::Original) || !entry.did_insert_occur {
+                continue;
+            }
+            let slot = *slot;
+            let meta = entry.new_slot_meta.borrow();
+            let Ok(consumed) = u32::try_from(meta.consumed) else {
+                continue;
+            };
+            let old_consumed = entry
+                .old_slot_meta
+                .as_ref()
+                .map_or(0, |old_slot_meta| old_slot_meta.consumed.min(meta.consumed) as u32);
+            let (completed_ranges, _) = Self::fast_path_ranges(
+                &meta.completed_data_indexes,
+                old_consumed,
+                consumed,
+                meta.last_index,
+            );
+            if completed_ranges.is_empty()
+                || !meta.is_parent_connected()
+                || dead_in_batch.contains(&slot)
+                || self.is_dead(slot)
+            {
+                continue;
+            }
+            for range in completed_ranges {
+                let Some(payload) = self.fast_path_payload(
+                    slot,
+                    range.clone(),
+                    &shred_insertion_tracker.just_inserted_shreds,
+                ) else {
+                    break;
+                };
+                published.push(FastComponent {
+                    slot,
+                    range: range.clone(),
+                    payload,
+                });
+                ranges.push((slot, range));
+            }
+        }
+        dead_in_batch.clear();
+        ranges
+    }
+
+    fn fast_path_payload(
+        &self,
+        slot: Slot,
+        range: Range<u32>,
+        just_inserted_shreds: &HashMap<(BlockLocation, ShredId), Cow<'_, Shred>>,
+    ) -> Option<Vec<u8>> {
+        let mut payloads: Vec<Option<shred::Payload>> = range
+            .clone()
+            .map(|index| {
+                just_inserted_shreds
+                    .get(&(
+                        BlockLocation::Original,
+                        ShredId::new(slot, index, ShredType::Data),
+                    ))
+                    .map(|shred| shred.payload().clone())
+            })
+            .collect();
+        let missing: Vec<usize> = payloads
+            .iter()
+            .enumerate()
+            .filter_map(|(position, payload)| payload.is_none().then_some(position))
+            .collect();
+        if !missing.is_empty() {
+            let keys = self.data_shred_cf.multi_get_keys(
+                missing
+                    .iter()
+                    .map(|position| (slot, u64::from(range.start) + *position as u64)),
+            );
+            for (position, stored) in missing
+                .iter()
+                .zip(self.data_shred_cf.multi_get_bytes(&keys))
+            {
+                payloads[*position] = Some(shred::Payload::from(stored.ok()??.as_ref().to_vec()));
+            }
+        }
+        let payloads: Vec<shred::Payload> = payloads.into_iter().collect::<Option<_>>()?;
+        Shredder::deshred(payloads).ok()
+    }
+
+    fn fast_path_ranges(
+        completed_data_indexes: &CompletedDataIndexes,
+        old_consumed: u32,
+        consumed: u32,
+        last_index: Option<u64>,
+    ) -> (CompletedRanges, u32) {
+        let boundary = |bound: u32| {
+            completed_data_indexes
+                .previous_completed_index(bound)
+                .map_or(0, |index| index + 1)
+        };
+        let start = boundary(old_consumed);
+        let end = boundary(consumed);
+        let ranges = if start < end {
+            Self::get_completed_data_ranges(start, completed_data_indexes, consumed)
+                .into_iter()
+                .take_while(|range| {
+                    last_index.is_none_or(|last_index| u64::from(range.end) <= last_index)
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+        (ranges, end)
+    }
+
+    pub fn take_fast_components(
+        &self,
+        slot: Slot,
+        start_index: u64,
+    ) -> Option<(Vec<ParsedBlockComponent>, Vec<Range<u32>>)> {
+        let taken = {
+            let mut fast_path = self.fast_path.lock().unwrap();
+            let mut next_index = start_index;
+            let mut taken = vec![];
+            while let Some(position) = fast_path.published.iter().position(|component| {
+                component.slot == slot && u64::from(component.range.start) == next_index
+            }) {
+                let component = fast_path.published.swap_remove(position);
+                next_index = u64::from(component.range.end);
+                taken.push(component);
+            }
+            taken
+        };
+        if taken.is_empty() || self.is_dead(slot) {
+            return None;
+        }
+        let mut components = Vec::with_capacity(taken.len());
+        let mut ranges = Vec::with_capacity(taken.len());
+        for FastComponent { range, payload, .. } in taken {
+            match block_component_parser::parse(payload) {
+                Ok(component @ ParsedBlockComponent::EntryBatch(_)) => {
+                    components.push(component);
+                    ranges.push(range);
+                }
+                _ => break,
+            }
+        }
+        (!components.is_empty()).then_some((components, ranges))
+    }
+
     fn commit_updates_to_write_batch(
         &self,
         shred_insertion_tracker: &mut ShredInsertionTracker,
@@ -2287,7 +2473,9 @@ impl Blockstore {
 
         // Acquire the insertion lock
         let mut start = Measure::start("Blockstore lock");
+        solana_runtime::shred_to_tx_timing::insert_begin();
         let lock = self.insert_shreds_lock.lock().unwrap();
+        solana_runtime::shred_to_tx_timing::insert_mark(InsertPart::Lock);
         start.stop();
         metrics.insert_lock_elapsed_us += start.as_us();
 
@@ -2326,6 +2514,7 @@ impl Blockstore {
         let insert_start = solana_runtime::slot_tail_timing::now_if_enabled();
         let shred_to_tx_insert_start = solana_runtime::shred_to_tx_timing::now_if_enabled();
         let shreds = shreds.into_iter();
+        solana_runtime::shred_to_tx_timing::insert_count(shreds.len());
         let mut shred_insertion_tracker = ShredInsertionTracker::new(shreds.len(), write_batch);
 
         self.attempt_shred_insertion(
@@ -2335,6 +2524,8 @@ impl Blockstore {
             &mut shred_insertion_tracker,
             metrics,
         );
+        solana_runtime::shred_to_tx_timing::insert_mark(InsertPart::Shreds);
+        let receiving = shred_recovery_context.is_some();
         if let Some(shred_recovery_context) = shred_recovery_context {
             self.handle_shred_recovery(
                 shred_recovery_context,
@@ -2344,6 +2535,31 @@ impl Blockstore {
                 metrics,
             );
         }
+        solana_runtime::shred_to_tx_timing::insert_mark(InsertPart::Recovery);
+        let fast_published = if receiving && solana_runtime::qn_flags::replay_entries_fast_path() {
+            self.publish_fast_components(&shred_insertion_tracker)
+        } else {
+            vec![]
+        };
+        let fast_publish_guard =
+            (!fast_published.is_empty()).then(|| FastPublishGuard(&self.fast_path));
+        if !fast_published.is_empty() {
+            if shred_to_tx_insert_start != 0 {
+                let published = solana_runtime::shred_to_tx_timing::now();
+                for (slot, range) in &fast_published {
+                    solana_runtime::shred_to_tx_timing::data_set_published(
+                        *slot,
+                        range.clone(),
+                        shred_to_tx_insert_start,
+                        published,
+                    );
+                }
+            }
+            for signal in self.new_shreds_signals.lock().unwrap().iter() {
+                let _ = signal.try_send(true);
+            }
+        }
+        solana_runtime::shred_to_tx_timing::insert_mark(InsertPart::Publish);
         // Handle chaining for the members of the slot_meta_working_set that
         // were inserted into, drop the others.
         self.handle_chaining(
@@ -2351,26 +2567,37 @@ impl Blockstore {
             &mut shred_insertion_tracker.slot_meta_working_set,
             metrics,
         )?;
+        solana_runtime::shred_to_tx_timing::insert_mark(InsertPart::Chaining);
 
         self.check_chained_merkle_root_consistency(&mut shred_insertion_tracker);
 
         // Compute DoubleMerkleMeta for any newly completed slots so it's committed atomically
         self.compute_double_merkle_meta_for_newly_completed_slots(&mut shred_insertion_tracker)?;
+        solana_runtime::shred_to_tx_timing::insert_mark(InsertPart::Merkle);
 
         let SignalUpdates {
             should_signal,
             newly_completed_slots_with_last_index,
             update_parent_signals,
         } = self.commit_updates_to_write_batch(&mut shred_insertion_tracker, metrics)?;
+        solana_runtime::shred_to_tx_timing::insert_mark(InsertPart::CommitMeta);
 
         // Write out the accumulated batch.
         let mut start = Measure::start("Write Batch");
         self.write_batch(&mut *shred_insertion_tracker.write_batch)?;
         start.stop();
         metrics.write_batch_elapsed_us += start.as_us();
+        drop(fast_publish_guard);
+        solana_runtime::shred_to_tx_timing::insert_mark(InsertPart::Write);
         if shred_to_tx_insert_start != 0 {
             let insert_done = solana_runtime::shred_to_tx_timing::now();
             for set in &shred_insertion_tracker.newly_completed_data_sets {
+                if fast_published
+                    .iter()
+                    .any(|(slot, range)| *slot == set.slot && range.end == set.indices.end)
+                {
+                    continue;
+                }
                 solana_runtime::shred_to_tx_timing::data_set_completed(
                     set.slot,
                     set.indices.clone(),
@@ -2406,6 +2633,14 @@ impl Blockstore {
             newly_completed_slots_with_last_index,
             update_parent_signals,
         );
+        if shred_to_tx_insert_start != 0 {
+            solana_runtime::shred_to_tx_timing::insert_finished(
+                shred_insertion_tracker
+                    .newly_completed_data_sets
+                    .iter()
+                    .map(|set| (set.slot, set.indices.end)),
+            );
+        }
 
         metrics.index_meta_time_us += shred_insertion_tracker.index_meta_time_us;
 

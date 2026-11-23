@@ -1630,7 +1630,17 @@ fn confirm_slot_once(
     let slot = bank.slot();
     let mut footer_without_final_component = false;
 
-    let (slot_components, completed_ranges, slot_full) = {
+    let fast_components = (qn_flags::replay_entries_fast_path() && !allow_dead_slots)
+        .then(|| blockstore.take_fast_components(slot, progress.num_shreds))
+        .flatten();
+    let fetched_fast = fast_components.is_some();
+    let (slot_components, completed_ranges, slot_full) = if let Some((
+        slot_components,
+        completed_ranges,
+    )) = fast_components
+    {
+        Ok((slot_components, completed_ranges, false))
+    } else {
         let mut load_elapsed = Measure::start("load_elapsed");
         let load_result = blockstore
             .get_slot_component_views_with_shred_info(slot, progress.num_shreds, allow_dead_slots)
@@ -1644,7 +1654,7 @@ fn confirm_slot_once(
         load_result
     }?;
     slot_tail_timing::mark(slot, Event::EntriesFetched);
-    shred_to_tx_timing::fetched(slot, &completed_ranges);
+    shred_to_tx_timing::fetched(slot, &completed_ranges, fetched_fast);
     tx_exec_timing::fetched();
     if qn_flags::replay_account_prefetch() {
         solana_runtime::account_prefetch::spawn(
