@@ -35,8 +35,10 @@ use {
             UninstalledScheduler, UninstalledSchedulerBox, initialized_result_with_timings,
         },
         prioritization_fee_cache::PrioritizationFeeCache,
+        qn_flags,
         transaction_execution::{
-            TransactionBatchWithIndexes, TransactionStatusSender, execute_batch,
+            BatchPostCommit, TransactionBatchWithIndexes, TransactionStatusSender, execute_batch,
+            execute_batch_until_commit, finish_batch_after_commit,
         },
         tx_exec_timing::{self, SchedulerThreadTiming, Step},
         vote_sender_types::{ReplayVoteSendType, ReplayVoteSender},
@@ -54,7 +56,7 @@ use {
         mem,
         sync::{
             Arc, Mutex, OnceLock, Weak,
-            atomic::{AtomicU64, Ordering::Relaxed},
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed},
         },
         thread::{self, JoinHandle, sleep},
         time::{Duration, Instant},
@@ -644,6 +646,25 @@ pub trait TaskHandler: Send + Sync + Debug + Sized + 'static {
         task: &Task,
         handler_context: &HandlerContext,
     );
+
+    fn handle_until_commit(
+        result: &mut Result<()>,
+        timings: &mut ExecuteTimings,
+        scheduling_context: &SchedulingContext,
+        task: &Task,
+        handler_context: &HandlerContext,
+    ) -> Option<BatchPostCommit> {
+        Self::handle(result, timings, scheduling_context, task, handler_context);
+        None
+    }
+
+    fn handle_after_commit(
+        _scheduling_context: &SchedulingContext,
+        _task: &Task,
+        _handler_context: &HandlerContext,
+        _post_commit: BatchPostCommit,
+    ) {
+    }
 }
 
 #[derive(Debug)]
@@ -683,6 +704,66 @@ impl TaskHandler for DefaultTaskHandler {
             handler_context.prioritization_fee_cache.as_deref(),
         );
         sleepless_testing::at(CheckPoint::TaskHandled(task_id));
+    }
+
+    fn handle_until_commit(
+        result: &mut Result<()>,
+        timings: &mut ExecuteTimings,
+        scheduling_context: &SchedulingContext,
+        task: &Task,
+        handler_context: &HandlerContext,
+    ) -> Option<BatchPostCommit> {
+        let bank = scheduling_context.bank();
+        let transaction = task.transaction();
+        let task_id = task.task_id();
+
+        let batch = bank.prepare_unlocked_batch_from_single_tx(transaction);
+
+        let transaction_indexes = vec![task_id.try_into().unwrap()];
+        let batch_with_indexes = TransactionBatchWithIndexes {
+            batch,
+            transaction_indexes,
+        };
+
+        let executed = execute_batch_until_commit(
+            &batch_with_indexes,
+            bank,
+            handler_context.transaction_status_sender.is_some(),
+            handler_context.replay_vote_sender.as_ref(),
+            ReplayVoteSendType::Executed {
+                replay_bank_id: bank.bank_id(),
+                replay_slot: bank.slot(),
+            },
+            timings,
+            handler_context.log_messages_bytes_limit,
+        );
+        let post_commit = match executed {
+            Ok(post_commit) => {
+                *result = Ok(());
+                Some(post_commit)
+            }
+            Err(error) => {
+                *result = Err(error);
+                None
+            }
+        };
+        sleepless_testing::at(CheckPoint::TaskHandled(task_id));
+        post_commit
+    }
+
+    fn handle_after_commit(
+        scheduling_context: &SchedulingContext,
+        task: &Task,
+        handler_context: &HandlerContext,
+        post_commit: BatchPostCommit,
+    ) {
+        finish_batch_after_commit(
+            std::slice::from_ref(task.transaction()),
+            scheduling_context.bank(),
+            handler_context.transaction_status_sender.as_ref(),
+            handler_context.prioritization_fee_cache.as_deref(),
+            post_commit,
+        );
     }
 }
 
@@ -1317,8 +1398,15 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
         // 4. the handler thread processes the dispatched task.
         // 5. the handler thread reply back to the scheduler thread as an executed task.
         // 6. the scheduler thread post-processes the executed task.
+        let spin = qn_flags::sched_spin();
+        let finish_before_notify = qn_flags::sched_finish_before_notify();
+        let post_commit_pending = Arc::new(AtomicUsize::new(0));
+        let session_active = Arc::new(AtomicBool::new(true));
+
         let scheduler_main_loop = {
             let handler_context = handler_context.clone_for_scheduler_thread();
+            let post_commit_pending = post_commit_pending.clone();
+            let session_active = session_active.clone();
             let session_result_sender = self.session_result_sender.clone();
             // Taking new_task_receiver here is important to ensure there's a single receiver. In
             // this way, the replay stage will get .send() failures reliably, after this scheduler
@@ -1394,6 +1482,18 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                         // makes no perf. difference...
                         let dummy_unblocked_task_receiver =
                             dummy_receiver(Self::can_receive_unblocked_task(&state_machine));
+                        if let Some(spin) = spin
+                            && !Self::can_receive_unblocked_task(&state_machine)
+                        {
+                            let deadline = Instant::now() + spin;
+                            while finished_blocked_task_receiver.is_empty()
+                                && new_task_receiver.is_empty()
+                                && finished_idle_task_receiver.is_empty()
+                                && Instant::now() < deadline
+                            {
+                                std::hint::spin_loop();
+                            }
+                        }
 
                         // There's something special called dummy_unblocked_task_receiver here.
                         // This odd pattern was needed to react to newly unblocked tasks from
@@ -1509,12 +1609,22 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                     }
                     assert!(mem::replace(&mut is_finished, false));
 
+                    while post_commit_pending.load(Relaxed) != 0 {
+                        if finished_blocked_task_receiver.try_recv().is_ok()
+                            || finished_idle_task_receiver.try_recv().is_ok()
+                        {
+                            break 'nonaborted_main_loop;
+                        }
+                        std::hint::spin_loop();
+                    }
+
                     sleepless_testing::at(CheckPoint::SessionFinished(current_slot));
                     // Finalize the current session after asserting it's explicitly requested so.
                     // Send result first because this is blocking the replay code-path.
                     session_result_sender
                         .send(result_with_timings)
                         .expect("always outlived receiver");
+                    session_active.store(false, Relaxed);
 
                     state_machine.reinitialize();
                     timing.reset();
@@ -1557,6 +1667,7 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                                 // enter into the preceding `while(!is_finished) {...}` loop again.
                                 // Before that, propagate new SchedulingContext to handler threads
                                 current_slot = new_context.slot();
+                                session_active.store(true, Relaxed);
                                 runnable_task_sender
                                     .send_chained_channel(
                                         &new_context,
@@ -1616,6 +1727,8 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
             let finished_blocked_task_sender = finished_blocked_task_sender.clone();
             let finished_idle_task_sender = finished_idle_task_sender.clone();
             let handler_timing = tx_exec_timing::enabled();
+            let post_commit_pending = post_commit_pending.clone();
+            let session_active = session_active.clone();
 
             // The following loop maintains and updates SchedulingContext as its
             // externally-provided state for each session in this way:
@@ -1652,6 +1765,16 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                 };
 
                 loop {
+                    if let Some(spin) = spin {
+                        let deadline = Instant::now() + spin;
+                        while runnable_task_receiver.for_select().is_empty()
+                            && runnable_task_receiver.aux_for_select().is_empty()
+                            && session_active.load(Relaxed)
+                            && Instant::now() < deadline
+                        {
+                            std::hint::spin_loop();
+                        }
+                    }
                     let (task, sender) = select_biased! {
                         recv(runnable_task_receiver.for_select()) -> message => {
                             let Ok(message) = message else {
@@ -1699,17 +1822,41 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                         }
                     }
                     let mut task = ExecutedTask::new_boxed(task);
-                    Self::execute_task_with_handler(
-                        runnable_task_receiver.context(),
-                        &mut task,
-                        &handler_context,
-                    );
+                    let post_commit = if finish_before_notify {
+                        TH::handle_until_commit(
+                            &mut task.result_with_timings.0,
+                            &mut task.result_with_timings.1,
+                            runnable_task_receiver.context(),
+                            &task.task,
+                            &handler_context,
+                        )
+                    } else {
+                        Self::execute_task_with_handler(
+                            runnable_task_receiver.context(),
+                            &mut task,
+                            &handler_context,
+                        );
+                        None
+                    };
+                    let post_commit = post_commit.map(|post_commit| {
+                        post_commit_pending.fetch_add(1, Relaxed);
+                        (task.task.clone(), post_commit)
+                    });
                     if let Some((slot, index)) = timed_task {
                         tx_exec_timing::handler_done(slot, index);
                     }
                     if sender.send(Ok(task)).is_err() {
                         warn!("handler_thread: scheduler thread aborted...");
                         break;
+                    }
+                    if let Some((task, post_commit)) = post_commit {
+                        TH::handle_after_commit(
+                            runnable_task_receiver.context(),
+                            &task,
+                            &handler_context,
+                            post_commit,
+                        );
+                        post_commit_pending.fetch_sub(1, Relaxed);
                     }
                 }
             }
@@ -2779,6 +2926,96 @@ mod tests {
             bank.wait_for_completed_scheduler(),
             Some((Err(TransactionError::CommitCancelled), _))
         );
+    }
+
+    #[test]
+    fn test_scheduler_finish_before_post_commit() {
+        agave_logger::setup();
+
+        static SECOND_TASK_HANDLED: AtomicBool = AtomicBool::new(false);
+        static UNLOCKED_BEFORE_POST_COMMIT: AtomicBool = AtomicBool::new(false);
+        static POST_COMMIT_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Debug)]
+        struct PostCommitHandler;
+        impl TaskHandler for PostCommitHandler {
+            fn handle(
+                _result: &mut Result<()>,
+                _timings: &mut ExecuteTimings,
+                _scheduling_context: &SchedulingContext,
+                task: &Task,
+                _handler_context: &HandlerContext,
+            ) {
+                if task.task_id() == 1 {
+                    SECOND_TASK_HANDLED.store(true, Relaxed);
+                }
+            }
+
+            fn handle_until_commit(
+                result: &mut Result<()>,
+                timings: &mut ExecuteTimings,
+                scheduling_context: &SchedulingContext,
+                task: &Task,
+                handler_context: &HandlerContext,
+            ) -> Option<BatchPostCommit> {
+                Self::handle(result, timings, scheduling_context, task, handler_context);
+                Some(BatchPostCommit::default())
+            }
+
+            fn handle_after_commit(
+                _scheduling_context: &SchedulingContext,
+                task: &Task,
+                _handler_context: &HandlerContext,
+                _post_commit: BatchPostCommit,
+            ) {
+                if task.task_id() == 0 {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !SECOND_TASK_HANDLED.load(Relaxed) && Instant::now() < deadline {
+                        sleep(Duration::from_millis(1));
+                    }
+                    UNLOCKED_BEFORE_POST_COMMIT.store(SECOND_TASK_HANDLED.load(Relaxed), Relaxed);
+                }
+                sleep(Duration::from_millis(50));
+                POST_COMMIT_COUNT.fetch_add(1, Relaxed);
+            }
+        }
+
+        let GenesisConfigInfo {
+            genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config(10_000);
+        let bank = Bank::new_for_tests(&genesis_config);
+        let (bank, _bank_forks) = setup_dummy_fork_graph(bank);
+        let pool = SchedulerPool::<PooledScheduler<PostCommitHandler>, _>::new_for_verification(
+            Some(2),
+            None,
+            None,
+            None,
+            None,
+        );
+        let scheduler = pool.do_take_scheduler(SchedulingContext::new(bank.clone()));
+        let bank = BankWithScheduler::new(bank, Some(Box::new(scheduler)));
+        let transactions = (0..2).map(|task_id| {
+            (
+                ReplayTransaction::from(system_transaction::transfer(
+                    &mint_keypair,
+                    &solana_pubkey::new_rand(),
+                    2,
+                    genesis_config.hash(),
+                )),
+                task_id,
+            )
+        });
+        bank.schedule_transaction_executions(transactions.collect::<Vec<_>>().into_iter())
+            .unwrap();
+        assert_matches!(bank.wait_for_completed_scheduler(), Some((Ok(()), _)));
+        if qn_flags::sched_finish_before_notify() {
+            assert_eq!(POST_COMMIT_COUNT.load(Relaxed), 2);
+            assert!(UNLOCKED_BEFORE_POST_COMMIT.load(Relaxed));
+        } else {
+            assert_eq!(POST_COMMIT_COUNT.load(Relaxed), 0);
+        }
     }
 
     fn do_test_scheduler_drop_abort(abort_case: AbortCase) {

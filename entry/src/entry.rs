@@ -255,6 +255,10 @@ where
         }
     }
 
+    pub fn append(&mut self, other: &mut Self) {
+        self.signatures.append(&mut other.signatures);
+    }
+
     /// Verifies all collected signatures in parallel on the current rayon
     /// thread pool, checking each signature individually.
     pub fn verify(&self) -> Result<()> {

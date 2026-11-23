@@ -16,6 +16,7 @@ use {
     solana_runtime_transaction::transaction_with_meta::{TransactionWithMeta, writable_accounts},
     solana_signature::Signature,
     solana_svm::{
+        transaction_balances::BalanceCollector,
         transaction_commit_result::{
             TransactionCommitResult, TransactionCommitResultExtensions as _,
         },
@@ -25,10 +26,7 @@ use {
     solana_transaction::sanitized::SanitizedTransaction,
     solana_transaction_error::{TransactionError, TransactionResult},
     solana_transaction_status::token_balances::TransactionTokenBalancesSet,
-    std::{
-        borrow::Cow,
-        sync::{Arc, OnceLock},
-    },
+    std::sync::{Arc, OnceLock},
 };
 
 type WorkSequence = u64;
@@ -62,6 +60,14 @@ pub struct TransactionBatchWithIndexes<'a, 'b, Tx: TransactionWithMeta> {
     pub transaction_indexes: Vec<usize>,
 }
 
+#[derive(Default)]
+pub struct BatchPostCommit {
+    commit_results: Vec<TransactionCommitResult>,
+    balance_collector: Option<BalanceCollector>,
+    costs: Vec<Option<u64>>,
+    transaction_indexes: Vec<usize>,
+}
+
 pub fn execute_batch<'a>(
     batch: &'a TransactionBatchWithIndexes<impl TransactionWithMeta>,
     bank: &'a Arc<Bank>,
@@ -72,13 +78,41 @@ pub fn execute_batch<'a>(
     log_messages_bytes_limit: Option<usize>,
     prioritization_fee_cache: Option<&'a PrioritizationFeeCache>,
 ) -> TransactionResult<()> {
+    let post_commit = execute_batch_until_commit(
+        batch,
+        bank,
+        transaction_status_sender.is_some(),
+        replay_vote_sender,
+        replay_vote_send_type,
+        timings,
+        log_messages_bytes_limit,
+    )?;
+    finish_batch_after_commit(
+        batch.batch.sanitized_transactions(),
+        bank,
+        transaction_status_sender,
+        prioritization_fee_cache,
+        post_commit,
+    );
+
+    Ok(())
+}
+
+pub fn execute_batch_until_commit<'a>(
+    batch: &'a TransactionBatchWithIndexes<impl TransactionWithMeta>,
+    bank: &'a Arc<Bank>,
+    record_transaction_status: bool,
+    replay_vote_sender: Option<&'a ReplayVoteSender>,
+    replay_vote_send_type: ReplayVoteSendType,
+    timings: &'a mut ExecuteTimings,
+    log_messages_bytes_limit: Option<usize>,
+) -> TransactionResult<BatchPostCommit> {
     let TransactionBatchWithIndexes {
         batch,
         transaction_indexes,
     } = batch;
 
-    let transaction_indexes = Cow::from(transaction_indexes);
-    crate::tx_exec_timing::exec_start(bank.slot(), &transaction_indexes);
+    crate::tx_exec_timing::exec_start(bank.slot(), transaction_indexes);
 
     let pre_commit_callback = |processing_results: &_| -> TransactionResult<()> {
         // We're entering into one of the block-verification methods.
@@ -89,14 +123,14 @@ pub fn execute_batch<'a>(
         .bank()
         .load_execute_and_commit_transactions_with_pre_commit_callback(
             batch,
-            ExecutionRecordingConfig::new_single_setting(transaction_status_sender.is_some()),
+            ExecutionRecordingConfig::new_single_setting(record_transaction_status),
             timings,
             log_messages_bytes_limit,
             pre_commit_callback,
         )?;
     slot_tail_timing::tx_committed(bank.slot());
-    crate::shred_to_tx_timing::committed(bank.slot(), &transaction_indexes);
-    crate::tx_exec_timing::committed(bank.slot(), &transaction_indexes);
+    crate::shred_to_tx_timing::committed(bank.slot(), transaction_indexes);
+    crate::tx_exec_timing::committed(bank.slot(), transaction_indexes);
 
     let mut check_block_costs_elapsed = Measure::start("check_block_costs");
 
@@ -119,16 +153,52 @@ pub fn execute_batch<'a>(
         replay_vote_send_type,
     );
 
+    let (costs, transaction_indexes) = if record_transaction_status {
+        // The length of costs vector needs to be consistent with all other
+        // vectors that are sent over (such as `transactions`). So, replace the
+        // None elements with Some(0)
+        (
+            tx_costs
+                .into_iter()
+                .map(|tx_cost_option| tx_cost_option.map(|tx_cost| tx_cost.sum()).or(Some(0)))
+                .collect(),
+            transaction_indexes.clone(),
+        )
+    } else {
+        (vec![], vec![])
+    };
+
+    Ok(BatchPostCommit {
+        commit_results,
+        balance_collector,
+        costs,
+        transaction_indexes,
+    })
+}
+
+pub fn finish_batch_after_commit(
+    transactions: &[impl TransactionWithMeta],
+    bank: &Arc<Bank>,
+    transaction_status_sender: Option<&TransactionStatusSender>,
+    prioritization_fee_cache: Option<&PrioritizationFeeCache>,
+    post_commit: BatchPostCommit,
+) {
+    let BatchPostCommit {
+        commit_results,
+        balance_collector,
+        costs,
+        transaction_indexes,
+    } = post_commit;
+
     if let Some(prioritization_fee_cache) = prioritization_fee_cache {
         let fee_paying_transactions = commit_results
             .iter()
-            .zip(batch.sanitized_transactions())
+            .zip(transactions)
             .filter_map(|(commit_result, tx)| commit_result.was_fee_paying().then_some(tx));
         prioritization_fee_cache.update(bank, fee_paying_transactions);
     }
     if let Some(transaction_status_sender) = transaction_status_sender {
-        let transactions: Vec<SanitizedTransaction> = batch
-            .sanitized_transactions()
+        let transactions: Vec<SanitizedTransaction> = transactions
             .iter()
             .map(|tx| tx.as_sanitized_transaction().into_owned())
             .collect();
@@ -144,14 +214,6 @@ pub fn execute_batch<'a>(
         let (balances, token_balances) =
             compile_collected_balances(balance_collector.unwrap_or_default());
 
-        // The length of costs vector needs to be consistent with all other
-        // vectors that are sent over (such as `transactions`). So, replace the
-        // None elements with Some(0)
-        let tx_costs = tx_costs
-            .into_iter()
-            .map(|tx_cost_option| tx_cost_option.map(|tx_cost| tx_cost.sum()).or(Some(0)))
-            .collect();
-
         transaction_status_sender.send_transaction_status_batch(
             bank.slot(),
             bank.bank_id(),
@@ -159,12 +221,10 @@ pub fn execute_batch<'a>(
             commit_results,
             balances,
             token_balances,
-            tx_costs,
-            transaction_indexes.into_owned(),
+            costs,
+            transaction_indexes,
         );
     }
-
-    Ok(())
 }
 
 fn check_block_cost_limits<Tx: TransactionWithMeta>(

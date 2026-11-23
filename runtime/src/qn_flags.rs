@@ -2,9 +2,12 @@ use {
     log::*,
     rayon::ThreadPool,
     solana_clock::{BankId, Slot},
-    std::sync::{
-        LazyLock, OnceLock,
-        atomic::{AtomicU64, Ordering::Relaxed},
+    std::{
+        sync::{
+            LazyLock, OnceLock,
+            atomic::{AtomicU64, Ordering::Relaxed},
+        },
+        time::Duration,
     },
 };
 
@@ -18,6 +21,37 @@ fn requires(name: &str, dependency_name: &str, dependency: bool) -> bool {
         warn!("{name}=1 ignored: requires {dependency_name}=1");
     }
     on && dependency
+}
+
+fn number(name: &str) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+static SCHED_FINISH_BEFORE_NOTIFY: LazyLock<bool> =
+    LazyLock::new(|| enabled("AGAVE_SCHED_FINISH_BEFORE_NOTIFY"));
+static SCHED_SPIN_US: LazyLock<u64> = LazyLock::new(|| number("AGAVE_SCHED_SPIN_US"));
+static REPLAY_POH_SPAWN_AFTER_SCHEDULE: LazyLock<bool> =
+    LazyLock::new(|| enabled("AGAVE_REPLAY_POH_SPAWN_AFTER_SCHEDULE"));
+static REPLAY_TX_VERIFY_PARALLEL_MIN: LazyLock<usize> =
+    LazyLock::new(|| number("AGAVE_REPLAY_TX_VERIFY_PARALLEL_MIN") as usize);
+
+pub fn sched_finish_before_notify() -> bool {
+    *SCHED_FINISH_BEFORE_NOTIFY
+}
+
+pub fn sched_spin() -> Option<Duration> {
+    (*SCHED_SPIN_US > 0).then(|| Duration::from_micros(*SCHED_SPIN_US))
+}
+
+pub fn replay_poh_spawn_after_schedule() -> bool {
+    *REPLAY_POH_SPAWN_AFTER_SCHEDULE
+}
+
+pub fn replay_tx_verify_parallel_min() -> usize {
+    *REPLAY_TX_VERIFY_PARALLEL_MIN
 }
 
 static GEYSER_TX_NOTIFY_INLINE: LazyLock<bool> =
@@ -227,5 +261,13 @@ pub fn log_flags() {
         footer_cert_verify_parallel(),
         shred_to_tx_timing(),
         tx_exec_timing(),
+    );
+    info!(
+        "qn sched flags: sched_finish_before_notify={} sched_spin_us={} \
+         replay_poh_spawn_after_schedule={} replay_tx_verify_parallel_min={}",
+        sched_finish_before_notify(),
+        *SCHED_SPIN_US,
+        replay_poh_spawn_after_schedule(),
+        replay_tx_verify_parallel_min(),
     );
 }

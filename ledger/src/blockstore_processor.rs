@@ -73,7 +73,7 @@ use {
         path::PathBuf,
         result,
         sync::{
-            Arc, OnceLock, RwLock,
+            Arc, Mutex, OnceLock, RwLock,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::{Duration, Instant},
@@ -256,9 +256,85 @@ fn process_entries(bank: &BankWithScheduler, entries: Vec<ReplayEntry>) -> Resul
     Ok(())
 }
 
+type VerifiedEntry = Result<(
+    EntryType<ReplayTransaction>,
+    entry::UnverifiedSignatures<Bytes>,
+)>;
+
+struct EntryVerifyJob {
+    claimed: AtomicBool,
+    done: AtomicBool,
+    entry: Mutex<Option<EntryView<Bytes>>>,
+    verified: Mutex<Option<VerifiedEntry>>,
+}
+
+struct EntryVerifyPipeline {
+    bank: Arc<Bank>,
+    jobs: Vec<EntryVerifyJob>,
+}
+
+impl EntryVerifyPipeline {
+    fn start(bank: &BankWithScheduler, entries: Vec<EntryView<Bytes>>) -> Arc<Self> {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+        let pipeline = Arc::new(Self {
+            bank: bank.clone_without_scheduler(),
+            jobs: entries
+                .into_iter()
+                .map(|entry| EntryVerifyJob {
+                    claimed: AtomicBool::new(false),
+                    done: AtomicBool::new(false),
+                    entry: Mutex::new(Some(entry)),
+                    verified: Mutex::new(None),
+                })
+                .collect(),
+        });
+        let helper = Arc::downgrade(&pipeline);
+        transaction_hash_verify_thread_pool().spawn(move || {
+            let Some(pipeline) = helper.upgrade() else {
+                return;
+            };
+            (1..pipeline.jobs.len())
+                .into_par_iter()
+                .for_each(|index| pipeline.verify(index));
+        });
+        pipeline
+    }
+
+    fn verify(&self, index: usize) {
+        let job = &self.jobs[index];
+        if job.claimed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let entry = job.entry.lock().unwrap().take().unwrap();
+        let mut unverified_signatures =
+            entry::UnverifiedSignatures::with_capacity(entry.transactions.len());
+        let verified = entry::validate_and_hash_entry_transactions(
+            entry,
+            &|unsanitized: UnsanitizedTransactionView<Bytes>| {
+                self.bank
+                    .verify_transaction(unsanitized, TransactionVerificationMode::HashOnly)
+            },
+            &mut unverified_signatures,
+        )
+        .map(|entry| (entry, unverified_signatures));
+        *job.verified.lock().unwrap() = Some(verified);
+        job.done.store(true, Ordering::Release);
+    }
+
+    fn take(&self, index: usize) -> VerifiedEntry {
+        self.verify(index);
+        let job = &self.jobs[index];
+        while !job.done.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+        job.verified.lock().unwrap().take().unwrap()
+    }
+}
+
 fn schedule_entries_incrementally<F>(
     bank: &BankWithScheduler,
-    entries: Vec<EntryView<Bytes>>,
+    mut entries: Vec<EntryView<Bytes>>,
     entry_tx_starting_indexes: &[usize],
     num_txs: usize,
     verify: &F,
@@ -270,16 +346,38 @@ where
     let mut unverified_signatures = entry::UnverifiedSignatures::with_capacity(num_txs);
     let mut tick_hashes = vec![];
     let mut at_block_boundary = false;
-    for (entry, &starting_index) in entries.into_iter().zip(entry_tx_starting_indexes) {
+    let parallel_min = qn_flags::replay_tx_verify_parallel_min();
+    let pipeline = (parallel_min > 0
+        && num_txs >= parallel_min
+        && entries
+            .iter()
+            .filter(|entry| !entry.transactions.is_empty())
+            .nth(1)
+            .is_some())
+    .then(|| EntryVerifyPipeline::start(bank, mem::take(&mut entries)));
+    let mut entries = entries.into_iter();
+    for (index, &starting_index) in entry_tx_starting_indexes.iter().enumerate() {
         let timing_start = tx_exec_timing::split_start();
-        let entry =
+        let entry = if let Some(pipeline) = &pipeline {
+            if index >= pipeline.jobs.len() {
+                break;
+            }
+            pipeline.take(index).map(|(entry, mut signatures)| {
+                unverified_signatures.append(&mut signatures);
+                entry
+            })
+        } else {
+            let Some(entry) = entries.next() else {
+                break;
+            };
             entry::validate_and_hash_entry_transactions(entry, verify, &mut unverified_signatures)
-                .inspect_err(|_| {
-                    warn!(
-                        "Ledger transaction hash verification failed at slot: {}",
-                        bank.slot()
-                    );
-                })?;
+        }
+        .inspect_err(|_| {
+            warn!(
+                "Ledger transaction hash verification failed at slot: {}",
+                bank.slot()
+            );
+        })?;
         tx_exec_timing::split_add(Step::TxVerify, timing_start);
         match entry {
             EntryType::Tick(hash) => {
@@ -1791,6 +1889,9 @@ fn confirm_slot_entries(
     slot_tail_timing::mark(slot, Event::TicksVerified);
     tx_exec_timing::mark(Step::Ticks);
     let last_entry_hash = entries.last().map(|e| e.hash);
+    let schedule_per_entry =
+        qn_flags::replay_schedule_per_entry() && num_txs < entry::PARALLEL_VERIFY_THRESHOLD;
+    let mut deferred_poh_verification = None;
     if !skip_verification {
         let start_hash = progress.last_entry;
         let verify_entries = entry::entry_views_to_verification_data(&entries);
@@ -1798,14 +1899,18 @@ fn confirm_slot_entries(
             "verify-batch-size",
             ("size", verify_entries.len() as i64, i64)
         );
-        progress
-            .async_verification(replay_verification_worker_pool)
-            .spawn_poh_verification(
-                replay_verification_worker_pool,
-                verify_entries,
-                start_hash,
-                slot,
-            )?;
+        if schedule_per_entry && qn_flags::replay_poh_spawn_after_schedule() {
+            deferred_poh_verification = Some((verify_entries, start_hash));
+        } else {
+            progress
+                .async_verification(replay_verification_worker_pool)
+                .spawn_poh_verification(
+                    replay_verification_worker_pool,
+                    verify_entries,
+                    start_hash,
+                    slot,
+                )?;
+        }
     }
 
     slot_tail_timing::mark(slot, Event::PohSpawned);
@@ -1817,9 +1922,7 @@ fn confirm_slot_entries(
         }
     };
 
-    let (entries, scheduled_incrementally) = if qn_flags::replay_schedule_per_entry()
-        && num_txs < entry::PARALLEL_VERIFY_THRESHOLD
-    {
+    let (entries, scheduled_incrementally) = if schedule_per_entry {
         let mut replay_timer = Measure::start("replay_elapsed");
         let scheduled = schedule_entries_incrementally(
             bank,
@@ -1833,6 +1936,16 @@ fn confirm_slot_entries(
         slot_tail_timing::mark(slot, Event::LastEntryScheduled);
         shred_to_tx_timing::scheduled(slot);
         tx_exec_timing::set_end(slot);
+        if let Some((verify_entries, start_hash)) = deferred_poh_verification {
+            progress
+                .async_verification(replay_verification_worker_pool)
+                .spawn_poh_verification(
+                    replay_verification_worker_pool,
+                    verify_entries,
+                    start_hash,
+                    slot,
+                )?;
+        }
         (vec![], Some(scheduled?))
     } else {
         (entries, None)
