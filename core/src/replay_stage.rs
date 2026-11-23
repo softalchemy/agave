@@ -91,6 +91,8 @@ use {
         commitment::BlockCommitmentCache,
         installed_scheduler_pool::BankWithScheduler,
         leader_schedule_utils::first_of_consecutive_leader_slots,
+        qn_flags,
+        slot_tail_timing::{self, Event},
         snapshot_controller::SnapshotController,
         transaction_execution::TransactionStatusSender,
         vote_sender_types::{ReplayVoteMessage, ReplayVoteSender},
@@ -247,6 +249,7 @@ struct CompletedBankReplay {
     replay_progress: Arc<RwLock<ConfirmationProgress>>,
     // True when the bank completed via the unified scheduler path.
     is_unified_scheduler_enabled: bool,
+    processed_notified: bool,
 }
 
 struct ProcessActiveBanksContext {
@@ -818,6 +821,22 @@ impl ReplayStage {
             .map_or(0, |hfs| hfs.slot());
         *replay_highest_frozen.highest_frozen_slot.lock().unwrap() = highest_frozen_slot;
 
+        if qn_flags::geyser_processed_at_footer()
+            && bank_notification_sender.is_some()
+            && let Some(slot_status_notifier) = slot_status_notifier.clone()
+        {
+            let installed = qn_flags::PROCESSED_AT_FOOTER_NOTIFIER
+                .set(Box::new(move |slot, parent_slot, bank_id| {
+                    slot_status_notifier.read().unwrap().notify_slot_processed(
+                        slot,
+                        Some(parent_slot),
+                        bank_id,
+                    );
+                }))
+                .is_ok();
+            info!("geyser processed at footer notifier installed: {installed}");
+        }
+
         let run_replay = move || {
             if let Some(arena) = replay_arena {
                 arena
@@ -959,6 +978,8 @@ impl ReplayStage {
                 if exit.load(Ordering::Relaxed) {
                     break;
                 }
+                slot_tail_timing::replay_pass();
+                solana_runtime::shred_to_tx_timing::replay_pass();
 
                 if matches!(
                     Self::process_bank_forks_commands(
@@ -3907,15 +3928,27 @@ impl ReplayStage {
         let replay_stats = bank_progress.replay_stats.clone();
 
         let scheduler_replay_outcome = Self::complete_scheduler_replay(bank, &replay_stats);
+        slot_tail_timing::mark(bank.slot(), Event::SchedulerCompleted);
         let is_unified_scheduler_enabled = matches!(
             scheduler_replay_outcome,
             SchedulerReplayOutcome::SchedulerReplayCompleted(_)
         );
+        let processed_at_footer = qn_flags::processed_at_footer_emitted(bank.bank_id());
+        let processed_notified = processed_at_footer
+            || (qn_flags::geyser_processed_early()
+                && matches!(
+                    scheduler_replay_outcome,
+                    SchedulerReplayOutcome::SchedulerReplayCompleted(Ok(()))
+                ));
+        if processed_notified && !processed_at_footer {
+            Self::notify_slot_processed_inline(process_active_banks_context, bank);
+        }
         let verify_result = Self::complete_replay_verification(
             &replay_stats,
             &bank_progress.replay_progress,
             async_verification_freelist,
         );
+        slot_tail_timing::mark(bank.slot(), Event::VerificationWaitDone);
 
         // Send this whether the block was valid or not. It is only used to
         // release buffered votes, if any.
@@ -3937,7 +3970,59 @@ impl ReplayStage {
             replay_stats,
             replay_progress: bank_progress.replay_progress.clone(),
             is_unified_scheduler_enabled,
+            processed_notified,
         })
+    }
+
+    fn notify_slot_processed_inline(
+        process_active_banks_context: &ProcessActiveBanksContext,
+        bank: &Bank,
+    ) {
+        if process_active_banks_context
+            .bank_notification_sender
+            .is_some()
+            && bank.parent().is_some()
+            && let Some(slot_status_notifier) =
+                process_active_banks_context.slot_status_notifier.as_ref()
+        {
+            slot_status_notifier.read().unwrap().notify_slot_processed(
+                bank.slot(),
+                Some(bank.parent_slot()),
+                bank.bank_id(),
+            );
+        }
+    }
+
+    fn notify_block_metadata(
+        process_active_banks_context: &ProcessActiveBanksContext,
+        bank: &Bank,
+        entry_count: u64,
+    ) {
+        if let Some(block_metadata_notifier) = process_active_banks_context
+            .block_metadata_notifier
+            .as_ref()
+        {
+            let parent_blockhash = bank
+                .parent()
+                .map(|bank| bank.last_blockhash())
+                .unwrap_or_default();
+            let commission_rate_in_basis_points =
+                bank.feature_set.snapshot().commission_rate_in_basis_points;
+            block_metadata_notifier.notify_block_metadata(
+                bank.parent_slot(),
+                &parent_blockhash.to_string(),
+                bank.slot(),
+                bank.bank_id(),
+                &bank.last_blockhash().to_string(),
+                &bank.get_rewards_and_num_partitions(),
+                Some(bank.clock().unix_timestamp),
+                Some(bank.block_height()),
+                bank.executed_transaction_count(),
+                entry_count,
+                commission_rate_in_basis_points,
+            );
+            slot_tail_timing::mark(bank.slot(), Event::BlockMetaNotified);
+        }
     }
 
     fn process_replay_results(
@@ -4075,6 +4160,9 @@ impl ReplayStage {
                     bank.freeze();
                     Ok(())
                 };
+                slot_tail_timing::mark(bank_slot, Event::FreezeDone);
+                solana_runtime::shred_to_tx_timing::frozen(bank_slot);
+                solana_runtime::tx_exec_timing::frozen(bank_slot);
 
                 datapoint_info!(
                     "bank_frozen",
@@ -4121,6 +4209,17 @@ impl ReplayStage {
                     bank.slot(),
                     r_replay_stats.batch_execute.totals
                 );
+                let processed_inline = qn_flags::geyser_processed_inline();
+                if processed_inline {
+                    Self::notify_block_metadata(
+                        process_active_banks_context,
+                        bank,
+                        r_replay_progress.num_entries as u64,
+                    );
+                    if !completed_replay.processed_notified {
+                        Self::notify_slot_processed_inline(process_active_banks_context, bank);
+                    }
+                }
                 new_frozen_slots.push(bank.slot());
                 if process_active_banks_context
                     .migration_status
@@ -4252,6 +4351,8 @@ impl ReplayStage {
                             dependency_work,
                         ))
                         .unwrap_or_else(|err| warn!("bank_notification_sender failed: {err:?}"));
+                    slot_tail_timing::mark(bank_slot, Event::FrozenSent);
+                    slot_tail_timing::maybe_report(bank_slot);
                 }
 
                 let bank_hash = bank.hash();
@@ -4269,29 +4370,12 @@ impl ReplayStage {
                     }
                 }
 
-                if let Some(block_metadata_notifier) = process_active_banks_context
-                    .block_metadata_notifier
-                    .as_ref()
-                {
-                    let parent_blockhash = bank
-                        .parent()
-                        .map(|bank| bank.last_blockhash())
-                        .unwrap_or_default();
-                    let commission_rate_in_basis_points =
-                        bank.feature_set.snapshot().commission_rate_in_basis_points;
-                    block_metadata_notifier.notify_block_metadata(
-                        bank.parent_slot(),
-                        &parent_blockhash.to_string(),
-                        bank.slot(),
-                        bank.bank_id(),
-                        &bank.last_blockhash().to_string(),
-                        &bank.get_rewards_and_num_partitions(),
-                        Some(bank.clock().unix_timestamp),
-                        Some(bank.block_height()),
-                        bank.executed_transaction_count(),
+                if !processed_inline {
+                    Self::notify_block_metadata(
+                        process_active_banks_context,
+                        bank,
                         r_replay_progress.num_entries as u64,
-                        commission_rate_in_basis_points,
-                    )
+                    );
                 }
                 bank_complete_time.stop();
 

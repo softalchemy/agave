@@ -373,6 +373,10 @@ impl OptimisticallyConfirmedBankTracker {
             }
             BankNotification::Frozen(bank) => {
                 let frozen_slot = bank.slot();
+                solana_runtime::slot_tail_timing::mark(
+                    frozen_slot,
+                    solana_runtime::slot_tail_timing::Event::FrozenHandled,
+                );
                 if let Some(parent) = bank.parent() {
                     let num_successful_transactions = bank
                         .transaction_count()
@@ -388,10 +392,16 @@ impl OptimisticallyConfirmedBankTracker {
                         },
                     });
 
-                    Self::notify_slot_status(
-                        slot_notification_subscribers,
-                        SlotNotification::Frozen((bank.slot(), bank.parent_slot(), bank.bank_id())),
-                    );
+                    if !solana_runtime::qn_flags::geyser_processed_inline() {
+                        Self::notify_slot_status(
+                            slot_notification_subscribers,
+                            SlotNotification::Frozen((
+                                bank.slot(),
+                                bank.parent_slot(),
+                                bank.bank_id(),
+                            )),
+                        );
+                    }
                 }
 
                 if pending_optimistically_confirmed_banks.remove(&(bank.slot(), bank.hash())) {

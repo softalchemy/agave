@@ -5,16 +5,21 @@
 
 use {
     crate::transaction_notifier_interface::TransactionNotifierArc,
-    crossbeam_channel::{Receiver, RecvTimeoutError},
+    crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded},
     itertools::izip,
     solana_clock::Slot,
     solana_ledger::blockstore::{Blockstore, BlockstoreError},
     solana_runtime::{
         bank::{Bank, KeyedRewardsAndNumPartitions},
         dependency_tracker::DependencyTracker,
-        transaction_execution::{TransactionStatusBatch, TransactionStatusMessage},
+        qn_flags,
+        slot_tail_timing::{self, Event},
+        transaction_execution::{
+            INLINE_TRANSACTION_STATUS_HANDLER, TransactionStatusBatch, TransactionStatusMessage,
+        },
     },
     solana_svm::transaction_commit_result::CommittedTransaction,
+    solana_transaction::sanitized::SanitizedTransaction,
     solana_transaction_status::{
         Reward, RewardsAndNumPartitions, TransactionStatusMeta, extract_and_fmt_memos,
         map_inner_instructions,
@@ -39,6 +44,15 @@ enum Error {
     NonFrozenBank(Slot),
 }
 type Result<T> = std::result::Result<T, Error>;
+
+// blockstore writes go to their own thread so RocksDB never sits between two geyser notifications
+enum BlockstoreWriteJob {
+    Statuses {
+        slot: Slot,
+        items: Vec<(SanitizedTransaction, TransactionStatusMeta, usize)>,
+    },
+    Freeze(Arc<Bank>),
+}
 
 // Used when draining and shutting down TSS in unit tests.
 #[cfg(feature = "dev-context-only-utils")]
@@ -65,6 +79,64 @@ impl TransactionStatusService {
         depenency_tracker: Option<Arc<DependencyTracker>>,
         exit: Arc<AtomicBool>,
     ) -> Self {
+        let (write_job_sender, write_job_receiver) = unbounded::<BlockstoreWriteJob>();
+        let notify_inline = qn_flags::geyser_tx_notify_inline() && transaction_notifier.is_some();
+        if notify_inline {
+            let transaction_notifier = transaction_notifier.clone();
+            let write_job_sender = write_job_sender.clone();
+            let installed = INLINE_TRANSACTION_STATUS_HANDLER
+                .set(Box::new(move |batch| {
+                    let _ = Self::write_transaction_status_batch(
+                        TransactionStatusMessage::Batch((batch, None)),
+                        enable_rpc_transaction_history,
+                        transaction_notifier.clone(),
+                        enable_extended_tx_metadata_storage,
+                        None,
+                        &write_job_sender,
+                    );
+                }))
+                .is_ok();
+            if installed {
+                info!("{} geyser transaction notify inline", Self::SERVICE_NAME);
+            } else {
+                warn!(
+                    "{} inline transaction status handler already installed",
+                    Self::SERVICE_NAME
+                );
+            }
+        }
+        let writer_hdl = Builder::new()
+            .name("solTxStatusBsWr".to_string())
+            .spawn({
+                let blockstore = blockstore.clone();
+                let max_complete_transaction_status_slot =
+                    max_complete_transaction_status_slot.clone();
+                let exit = exit.clone();
+                move || {
+                    loop {
+                        let job = match write_job_receiver.recv_timeout(Duration::from_secs(1)) {
+                            Ok(job) => job,
+                            Err(RecvTimeoutError::Disconnected) => break,
+                            Err(RecvTimeoutError::Timeout) => {
+                                if notify_inline && exit.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                continue;
+                            }
+                        };
+                        if let Err(err) = Self::run_blockstore_write_job(
+                            job,
+                            &blockstore,
+                            &max_complete_transaction_status_slot,
+                        ) {
+                            error!("{} writer is stopping because: {err}", Self::SERVICE_NAME);
+                            exit.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                }
+            })
+            .unwrap();
         let thread_hdl = Builder::new()
             .name("solTxStatusWrtr".to_string())
             .spawn({
@@ -91,12 +163,11 @@ impl TransactionStatusService {
 
                         match Self::write_transaction_status_batch(
                             message,
-                            &max_complete_transaction_status_slot,
                             enable_rpc_transaction_history,
                             transaction_notifier.clone(),
-                            &blockstore,
                             enable_extended_tx_metadata_storage,
                             depenency_tracker.clone(),
+                            &write_job_sender,
                         ) {
                             Ok(_) => {}
                             Err(err) => {
@@ -106,6 +177,8 @@ impl TransactionStatusService {
                             }
                         }
                     }
+                    drop(write_job_sender);
+                    let _ = writer_hdl.join();
                     info!("{} has stopped", Self::SERVICE_NAME);
                 }
             })
@@ -119,12 +192,11 @@ impl TransactionStatusService {
 
     fn write_transaction_status_batch(
         transaction_status_message: TransactionStatusMessage,
-        max_complete_transaction_status_slot: &Arc<AtomicU64>,
         enable_rpc_transaction_history: bool,
         transaction_notifier: Option<TransactionNotifierArc>,
-        blockstore: &Blockstore,
         enable_extended_tx_metadata_storage: bool,
         dependency_tracker: Option<Arc<DependencyTracker>>,
+        write_job_sender: &Sender<BlockstoreWriteJob>,
     ) -> Result<()> {
         match transaction_status_message {
             TransactionStatusMessage::Batch((
@@ -140,8 +212,8 @@ impl TransactionStatusService {
                 },
                 work_id,
             )) => {
-                let mut status_and_memos_batch = if enable_rpc_transaction_history {
-                    Some(blockstore.get_write_batch())
+                let mut write_items = if enable_rpc_transaction_history {
+                    Some(Vec::with_capacity(transactions.len()))
                 } else {
                     None
                 };
@@ -219,6 +291,9 @@ impl TransactionStatusService {
                             &transaction_status_meta,
                             &transaction,
                         );
+                        slot_tail_timing::mark_max(slot, Event::LastTxGeyserNotified);
+                        solana_runtime::shred_to_tx_timing::notified(slot, transaction_index);
+                        solana_runtime::tx_exec_timing::notified(slot, transaction_index);
                     }
 
                     if !(enable_extended_tx_metadata_storage || transaction_notifier.is_some()) {
@@ -227,36 +302,13 @@ impl TransactionStatusService {
                         transaction_status_meta.return_data.take();
                     }
 
-                    if let Some(batch) = status_and_memos_batch.as_mut() {
-                        if let Some(memos) = extract_and_fmt_memos(transaction.message()) {
-                            blockstore.add_transaction_memos_to_batch(
-                                transaction.signature(),
-                                slot,
-                                memos,
-                                batch,
-                            )?;
-                        }
-
-                        let message = transaction.message();
-                        let keys_with_writable = message
-                            .account_keys()
-                            .iter()
-                            .enumerate()
-                            .map(|(index, key)| (key, message.is_writable(index)));
-
-                        blockstore.add_transaction_status_to_batch(
-                            slot,
-                            *transaction.signature(),
-                            keys_with_writable,
-                            transaction_status_meta,
-                            transaction_index,
-                            batch,
-                        )?;
+                    if let Some(items) = write_items.as_mut() {
+                        items.push((transaction, transaction_status_meta, transaction_index));
                     }
                 }
 
-                if let Some(batch) = status_and_memos_batch {
-                    blockstore.write_batch(batch)?;
+                if let Some(items) = write_items {
+                    let _ = write_job_sender.send(BlockstoreWriteJob::Statuses { slot, items });
                 }
 
                 if let Some(dependency_tracker) = dependency_tracker.as_ref()
@@ -269,6 +321,49 @@ impl TransactionStatusService {
                 if !bank.is_frozen() {
                     return Err(Error::NonFrozenBank(bank.slot()));
                 }
+                let _ = write_job_sender.send(BlockstoreWriteJob::Freeze(bank));
+            }
+        }
+        Ok(())
+    }
+
+    fn run_blockstore_write_job(
+        job: BlockstoreWriteJob,
+        blockstore: &Blockstore,
+        max_complete_transaction_status_slot: &Arc<AtomicU64>,
+    ) -> Result<()> {
+        match job {
+            BlockstoreWriteJob::Statuses { slot, items } => {
+                let mut batch = blockstore.get_write_batch();
+                for (transaction, transaction_status_meta, transaction_index) in items {
+                    if let Some(memos) = extract_and_fmt_memos(transaction.message()) {
+                        blockstore.add_transaction_memos_to_batch(
+                            transaction.signature(),
+                            slot,
+                            memos,
+                            &mut batch,
+                        )?;
+                    }
+
+                    let message = transaction.message();
+                    let keys_with_writable = message
+                        .account_keys()
+                        .iter()
+                        .enumerate()
+                        .map(|(index, key)| (key, message.is_writable(index)));
+
+                    blockstore.add_transaction_status_to_batch(
+                        slot,
+                        *transaction.signature(),
+                        keys_with_writable,
+                        transaction_status_meta,
+                        transaction_index,
+                        &mut batch,
+                    )?;
+                }
+                blockstore.write_batch(batch)?;
+            }
+            BlockstoreWriteJob::Freeze(bank) => {
                 Self::write_block_meta(&bank, blockstore)?;
                 max_complete_transaction_status_slot.fetch_max(bank.slot(), Ordering::SeqCst);
             }

@@ -40,6 +40,7 @@ pub use {
 };
 use {
     crate::{
+        slot_tail_timing,
         account_saver::collect_accounts_to_store,
         alpenglow_epoch_type::{AlpenglowEpochType, RewardEpochDelegatedStakes},
         bank::{
@@ -99,7 +100,12 @@ use {
     crossbeam_utils::CachePadded,
     log::*,
     partitioned_epoch_rewards::PartitionedRewardsCalculation,
-    rayon::ThreadPool,
+    rayon::{
+        ThreadPool,
+        iter::{
+            IndexedParallelIterator as _, IntoParallelRefIterator as _, ParallelIterator as _,
+        },
+    },
     serde::{Deserialize, Serialize},
     solana_account::{
         Account, AccountSharedData, InheritableAccountFields, ReadableAccount, WritableAccount,
@@ -107,7 +113,7 @@ use {
     solana_accounts_db::{
         account_locks::validate_account_locks,
         account_storage_entry::AccountStorageEntry,
-        accounts::{AccountAddressFilter, Accounts},
+        accounts::{AccountAddressFilter, Accounts, LARGE_STORE_NUM_ACCOUNTS},
         accounts_db::{AccountsDb, AccountsDbConfig},
         accounts_hash::AccountsLtHash,
         accounts_index::IndexKey,
@@ -242,6 +248,7 @@ mod address_lookup_table;
 pub mod bank_hash_details;
 pub mod builtins;
 mod check_transactions;
+pub mod speculation;
 pub mod entry_bytes_budget;
 mod fee_distribution;
 mod metrics;
@@ -2724,6 +2731,7 @@ impl Bank {
         // actually updated since tests don't need to be optimized for performance.
         self.transaction_processor
             .reset_and_fill_sysvar_cache_entries(self);
+        speculation::environment_changed();
     }
 
     fn update_slot_history(&self) {
@@ -3659,6 +3667,7 @@ impl Bank {
 
         self.transaction_processor
             .reset_and_fill_sysvar_cache_entries(self);
+        speculation::environment_changed();
     }
 
     /// Get the nanosecond clock value. Returns `None` if the nanosecond clock has not been
@@ -3858,13 +3867,17 @@ impl Bank {
         let sanitized_txs = txs
             .into_iter()
             .map(|tx| {
-                RuntimeTransaction::try_create(
+                let mut tx = RuntimeTransaction::try_create(
                     tx,
                     MessageHash::Compute,
                     None,
                     self,
                     self.get_reserved_account_keys(),
-                )
+                )?;
+                if !self.feature_set.snapshot().loaderv3_programdata_size_floor {
+                    tx.load_implicit_read_locks();
+                }
+                Ok(tx)
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(TransactionBatch::new(
@@ -3933,7 +3946,7 @@ impl Bank {
     }
 
     /// Prepare a transaction batch from a single transaction without locking accounts
-    pub fn prepare_unlocked_batch_from_single_tx<'a, Tx: SVMMessage>(
+    pub fn prepare_unlocked_batch_from_single_tx<'a, Tx: TransactionWithMeta>(
         &'a self,
         transaction: &'a Tx,
     ) -> TransactionBatch<'a, 'a, Tx> {
@@ -4168,7 +4181,7 @@ impl Bank {
         account_overrides
     }
 
-    pub fn unlock_accounts<'a, Tx: SVMMessage + 'a>(
+    pub fn unlock_accounts<'a, Tx: TransactionWithMeta + 'a>(
         &self,
         txs_and_results: impl Iterator<Item = (&'a Tx, &'a Result<()>)> + Clone,
     ) {
@@ -4192,7 +4205,7 @@ impl Bank {
 
     pub fn collect_balances(
         &self,
-        batch: &TransactionBatch<impl SVMMessage>,
+        batch: &TransactionBatch<impl TransactionWithMeta>,
     ) -> TransactionBalances {
         let mut balances: TransactionBalances = vec![];
         for transaction in batch.sanitized_transactions() {
@@ -4246,6 +4259,29 @@ impl Bank {
         error_counters: &mut TransactionErrorMetrics,
         processing_config: TransactionProcessingConfig,
     ) -> LoadAndExecuteTransactionsOutput {
+        self.load_and_execute_transactions_with_callbacks(
+            self,
+            true,
+            batch,
+            max_age,
+            timings,
+            error_counters,
+            processing_config,
+        )
+    }
+
+    fn load_and_execute_transactions_with_callbacks<
+        CB: TransactionProcessingCallback + InvokeContextCallback,
+    >(
+        &self,
+        callbacks: &CB,
+        record_logs: bool,
+        batch: &TransactionBatch<impl TransactionWithMeta>,
+        max_age: usize,
+        timings: &mut ExecuteTimings,
+        error_counters: &mut TransactionErrorMetrics,
+        processing_config: TransactionProcessingConfig,
+    ) -> LoadAndExecuteTransactionsOutput {
         let sanitized_txs = batch.sanitized_transactions();
 
         let (check_results, check_us) = measure_us!(self.check_transactions_before_execution(
@@ -4285,7 +4321,7 @@ impl Bank {
         let sanitized_output = self
             .transaction_processor
             .load_and_execute_sanitized_transactions(
-                self,
+                callbacks,
                 sanitized_txs,
                 check_results,
                 &processing_environment,
@@ -4298,8 +4334,9 @@ impl Bank {
         // Accumulate the transaction batch execution timings.
         timings.accumulate(&sanitized_output.execute_timings);
 
-        let ((), collect_logs_us) =
-            measure_us!(self.collect_logs(sanitized_txs, &sanitized_output.processing_results));
+        let ((), collect_logs_us) = measure_us!(if record_logs {
+            self.collect_logs(sanitized_txs, &sanitized_output.processing_results)
+        });
         timings.saturating_add_in_place(ExecuteTimingType::CollectLogsUs, collect_logs_us);
 
         let mut processed_counts = ProcessedTransactionCounts::default();
@@ -4310,7 +4347,11 @@ impl Bank {
             .iter()
             .zip(sanitized_txs)
         {
-            if let Some(debug_keys) = &self.transaction_debug_keys {
+            if let Some(debug_keys) = self
+                .transaction_debug_keys
+                .as_ref()
+                .filter(|_| record_logs)
+            {
                 for key in tx.account_keys().iter() {
                     if debug_keys.contains(key) {
                         let result = processing_result.flattened_result();
@@ -4602,13 +4643,17 @@ impl Bank {
 
             let to_store = (self.slot(), accounts_to_store.as_slice());
             self.update_bank_hash_stats(&to_store);
+            let timing_start = crate::tx_exec_timing::part_start();
             self.enqueue_on_chain_accounts_lt_hash_updates(&to_store);
+            let timing_start =
+                crate::tx_exec_timing::part_add(crate::tx_exec_timing::Part::LtHash, timing_start);
             self.rc.accounts.store_accounts(
                 to_store,
                 self.bank_id(),
                 transactions.as_deref(),
                 &self.ancestors,
             );
+            crate::tx_exec_timing::part_add(crate::tx_exec_timing::Part::Store, timing_start);
         });
 
         // Cached vote and stake accounts are synchronized with accounts-db
@@ -4636,6 +4681,7 @@ impl Bank {
                                 self.slot,
                                 programs_modified_by_tx,
                             );
+                        speculation::environment_changed();
                     }
                 }
             }
@@ -4671,6 +4717,86 @@ impl Bank {
         );
 
         Self::create_commit_results(processing_results)
+    }
+
+    pub fn take_commit_results_before_commit(
+        processing_results: &mut [TransactionProcessingResult],
+    ) -> Vec<TransactionCommitResult> {
+        processing_results
+            .iter_mut()
+            .map(|processing_result| {
+                let processing_result = match processing_result {
+                    Ok(processing_result) => processing_result,
+                    Err(error) => return Err(error.clone()),
+                };
+                let executed_units = processing_result.executed_units();
+                let loaded_accounts_data_size = processing_result.loaded_accounts_data_size();
+
+                match processing_result {
+                    ProcessedTransaction::Executed(executed_tx) => {
+                        let successful = executed_tx.was_successful();
+                        let fee_payer_post_balance = if successful {
+                            executed_tx.loaded_transaction.accounts[0].1.lamports()
+                        } else {
+                            executed_tx
+                                .loaded_transaction
+                                .rollback_accounts
+                                .fee_payer()
+                                .1
+                                .lamports()
+                        };
+                        let execution_details = &mut executed_tx.execution_details;
+
+                        Ok(CommittedTransaction {
+                            status: execution_details.status.clone(),
+                            log_messages: execution_details.log_messages.take(),
+                            inner_instructions: execution_details.inner_instructions.take(),
+                            return_data: execution_details.return_data.take(),
+                            executed_units,
+                            fee_details: executed_tx.loaded_transaction.fee_details,
+                            loaded_account_stats: TransactionLoadedAccountsStats {
+                                loaded_accounts_count: executed_tx
+                                    .loaded_transaction
+                                    .accounts
+                                    .len(),
+                                loaded_accounts_data_size,
+                            },
+                            fee_payer_post_balance,
+                        })
+                    }
+                    ProcessedTransaction::FeesOnly(fees_only_tx) => Ok(CommittedTransaction {
+                        status: Err(fees_only_tx.load_error.clone()),
+                        log_messages: None,
+                        inner_instructions: None,
+                        return_data: None,
+                        executed_units,
+                        fee_details: fees_only_tx.fee_details,
+                        loaded_account_stats: TransactionLoadedAccountsStats {
+                            loaded_accounts_count: fees_only_tx.rollback_accounts.count(),
+                            loaded_accounts_data_size,
+                        },
+                        fee_payer_post_balance: fees_only_tx
+                            .rollback_accounts
+                            .fee_payer()
+                            .1
+                            .lamports(),
+                    }),
+                    ProcessedTransaction::NoOp(no_op_tx) => Ok(CommittedTransaction {
+                        status: Err(no_op_tx.validation_error.clone()),
+                        log_messages: None,
+                        inner_instructions: None,
+                        return_data: None,
+                        executed_units,
+                        fee_details: FeeDetails::default(),
+                        loaded_account_stats: TransactionLoadedAccountsStats {
+                            loaded_accounts_count: 0,
+                            loaded_accounts_data_size,
+                        },
+                        fee_payer_post_balance: no_op_tx.fee_payer_balance.unwrap_or(0),
+                    }),
+                }
+            })
+            .collect()
     }
 
     fn create_commit_results(
@@ -4792,7 +4918,8 @@ impl Bank {
             recording_config,
             timings,
             log_messages_bytes_limit,
-            None::<fn(&_) -> _>,
+            None::<fn(&mut Vec<TransactionProcessingResult>, &mut Option<BalanceCollector>) -> _>,
+            None,
         )
         .unwrap()
     }
@@ -4810,7 +4937,56 @@ impl Bank {
             recording_config,
             timings,
             log_messages_bytes_limit,
+            Some(
+                |processing_results: &mut Vec<TransactionProcessingResult>,
+                 _: &mut Option<BalanceCollector>| {
+                    pre_commit_callback(processing_results.as_slice())
+                },
+            ),
+            None,
+        )
+    }
+
+    pub fn load_execute_and_commit_transactions_with_pre_commit_access(
+        &self,
+        batch: &TransactionBatch<impl TransactionWithMeta>,
+        recording_config: ExecutionRecordingConfig,
+        timings: &mut ExecuteTimings,
+        log_messages_bytes_limit: Option<usize>,
+        pre_commit_callback: impl FnOnce(
+            &mut Vec<TransactionProcessingResult>,
+            &mut Option<BalanceCollector>,
+        ) -> Result<()>,
+    ) -> Result<(Vec<TransactionCommitResult>, Option<BalanceCollector>)> {
+        self.do_load_execute_and_commit_transactions_with_pre_commit_callback(
+            batch,
+            recording_config,
+            timings,
+            log_messages_bytes_limit,
             Some(pre_commit_callback),
+            None,
+        )
+    }
+
+    pub fn load_execute_and_commit_transactions_with_pre_commit_access_and_speculation(
+        &self,
+        batch: &TransactionBatch<impl TransactionWithMeta>,
+        recording_config: ExecutionRecordingConfig,
+        timings: &mut ExecuteTimings,
+        log_messages_bytes_limit: Option<usize>,
+        pre_commit_callback: impl FnOnce(
+            &mut Vec<TransactionProcessingResult>,
+            &mut Option<BalanceCollector>,
+        ) -> Result<()>,
+        speculation: Option<speculation::Speculation>,
+    ) -> Result<(Vec<TransactionCommitResult>, Option<BalanceCollector>)> {
+        self.do_load_execute_and_commit_transactions_with_pre_commit_callback(
+            batch,
+            recording_config,
+            timings,
+            log_messages_bytes_limit,
+            Some(pre_commit_callback),
+            speculation,
         )
     }
 
@@ -4820,37 +4996,55 @@ impl Bank {
         recording_config: ExecutionRecordingConfig,
         timings: &mut ExecuteTimings,
         log_messages_bytes_limit: Option<usize>,
-        pre_commit_callback: Option<impl FnOnce(&[TransactionProcessingResult]) -> Result<()>>,
+        pre_commit_callback: Option<
+            impl FnOnce(
+                &mut Vec<TransactionProcessingResult>,
+                &mut Option<BalanceCollector>,
+            ) -> Result<()>,
+        >,
+        speculation: Option<speculation::Speculation>,
     ) -> Result<(Vec<TransactionCommitResult>, Option<BalanceCollector>)> {
         let execution_guard = self.try_enter_transaction_execution();
         let LoadAndExecuteTransactionsOutput {
-            processing_results,
+            mut processing_results,
             processed_counts,
-            balance_collector,
+            mut balance_collector,
         } = if let Some(execution_guard) = execution_guard.as_ref() {
-            execution_guard.load_and_execute_transactions(
-                batch,
-                self.max_processing_age(),
-                timings,
-                &mut TransactionErrorMetrics::default(),
-                TransactionProcessingConfig {
-                    account_overrides: None,
-                    log_messages_bytes_limit,
-                    limit_to_load_programs: false,
+            if speculation.is_some() {
+                self.load_and_execute_or_accept_speculation(
+                    execution_guard,
+                    batch,
                     recording_config,
-                    drop_on_failure: false,
-                    all_or_nothing: false,
-                    strict_nonce_size_check: false,
-                    drop_noop_transactions: false,
-                    drop_bail_out_transactions: false,
-                },
-            )
+                    timings,
+                    log_messages_bytes_limit,
+                    speculation,
+                )
+            } else {
+                execution_guard.load_and_execute_transactions(
+                    batch,
+                    self.max_processing_age(),
+                    timings,
+                    &mut TransactionErrorMetrics::default(),
+                    TransactionProcessingConfig {
+                        account_overrides: None,
+                        log_messages_bytes_limit,
+                        limit_to_load_programs: false,
+                        recording_config,
+                        drop_on_failure: false,
+                        all_or_nothing: false,
+                        strict_nonce_size_check: false,
+                        drop_noop_transactions: false,
+                        drop_bail_out_transactions: false,
+                    },
+                )
+            }
         } else {
             Self::cancelled_load_and_execute_tx_batch(batch)
         };
+        crate::tx_exec_timing::executed();
 
         if let Some(pre_commit_callback) = pre_commit_callback {
-            let () = pre_commit_callback(&processing_results)?;
+            let () = pre_commit_callback(&mut processing_results, &mut balance_collector)?;
         }
 
         let commit_results = if let Some(execution_guard) = execution_guard.as_ref() {
@@ -5015,6 +5209,9 @@ impl Bank {
                 )
             })
         });
+        if accounts.len() >= LARGE_STORE_NUM_ACCOUNTS {
+            slot_tail_timing::mark(self.slot(), slot_tail_timing::Event::StoreStakesCacheDone);
+        }
         self.store_accounts_without_stakes_cache(accounts, thread_pool_for_loading_accounts);
         m.stop();
         self.rc
@@ -5023,6 +5220,84 @@ impl Bank {
             .stats
             .stakes_cache_check_and_store_us
             .fetch_add(m.as_us(), Relaxed);
+    }
+
+    pub(crate) fn store_footer_accounts(
+        &self,
+        accounts: &[(Pubkey, AccountSharedData)],
+        thread_pool: &ThreadPool,
+        parallel_geyser: bool,
+        lt_hash_on_pool: bool,
+    ) {
+        assert!(!self.freeze_started());
+        let storable = (self.slot(), accounts);
+        let previous_accounts: Option<Vec<Option<AccountSharedData>>> = lt_hash_on_pool.then(|| {
+            thread_pool.install(|| {
+                accounts
+                    .par_iter()
+                    .map(|(pubkey, _)| {
+                        self.rc
+                            .accounts
+                            .load_with_fixed_root_do_not_populate_read_cache(&self.ancestors, pubkey)
+                            .map(|(account, _slot)| account)
+                    })
+                    .collect()
+            })
+        });
+        thread_pool.in_place_scope(|scope| {
+            if let Some(previous_accounts) = previous_accounts.as_ref() {
+                scope.spawn(move |_| {
+                    let delta = accounts
+                        .par_iter()
+                        .zip(previous_accounts.par_iter())
+                        .fold(LtHash::identity, |mut delta, ((pubkey, account), previous)| {
+                            if let Some(previous) = previous {
+                                delta.mix_out(&AccountsDb::lt_hash_account(previous, pubkey).0);
+                            }
+                            if account.lamports() != 0 {
+                                delta.mix_in(&AccountsDb::lt_hash_account(account, pubkey).0);
+                            }
+                            delta
+                        })
+                        .reduce(LtHash::identity, |mut delta, other| {
+                            delta.mix_in(&other);
+                            delta
+                        });
+                    self.accounts_lt_hash.lock().unwrap().0.mix_in(&delta);
+                });
+            }
+            let new_warmup_cooldown_rate_epoch = self.new_warmup_cooldown_rate_epoch();
+            let in_epoch_rewards_period = self.in_epoch_rewards_period();
+            let remove_inactive_stakes = self.feature_set.snapshot().remove_inactive_stakes;
+            for (pubkey, account) in accounts {
+                self.stakes_cache.check_and_store(
+                    pubkey,
+                    account,
+                    new_warmup_cooldown_rate_epoch,
+                    in_epoch_rewards_period,
+                    remove_inactive_stakes,
+                );
+            }
+            slot_tail_timing::mark(self.slot(), slot_tail_timing::Event::StoreStakesCacheDone);
+            self.update_bank_hash_stats(&storable);
+            if !lt_hash_on_pool {
+                self.enqueue_off_chain_accounts_lt_hash_updates(&storable, Some(thread_pool));
+            }
+            slot_tail_timing::mark(self.slot(), slot_tail_timing::Event::StoreLtHashEnqueued);
+            if parallel_geyser {
+                self.rc.accounts.store_accounts_with_parallel_notify(
+                    self.slot(),
+                    accounts,
+                    self.bank_id(),
+                    &self.ancestors,
+                    thread_pool,
+                );
+            } else {
+                self.rc
+                    .accounts
+                    .store_accounts(storable, self.bank_id(), None, &self.ancestors);
+            }
+        });
     }
 
     fn store_account_without_stakes_cache(&self, pubkey: &Pubkey, account: &AccountSharedData) {
@@ -5045,6 +5320,9 @@ impl Bank {
             &accounts,
             thread_pool_for_loading_accounts,
         );
+        if accounts.len() >= LARGE_STORE_NUM_ACCOUNTS {
+            slot_tail_timing::mark(self.slot(), slot_tail_timing::Event::StoreLtHashEnqueued);
+        }
         self.rc
             .accounts
             .store_accounts(accounts, self.bank_id(), None, &self.ancestors);
@@ -5774,7 +6052,8 @@ impl Bank {
 
         // WARNING: Any pending features added here most likely must also be checked in
         //          `Bank::resanitize_transaction_minimally`.
-        let sanitized_tx = {
+        let mut sanitized_tx = {
+            let timing_start = crate::tx_exec_timing::split_start();
             let size = tx.data().len();
             if size > max_transaction_size {
                 return Err(TransactionError::SanitizeFailure);
@@ -5802,16 +6081,29 @@ impl Bank {
                 MessageHash::Compute,
                 None,
             )?;
+            let timing_sanitized = crate::tx_exec_timing::split_add(
+                crate::tx_exec_timing::Step::TxSanitizeHash,
+                timing_start,
+            );
 
             let (loaded_addresses, _) = self.load_addresses_for_view(&sanitized_tx)?;
+            let timing_loaded = crate::tx_exec_timing::split_add(
+                crate::tx_exec_timing::Step::TxAlt,
+                timing_sanitized,
+            );
 
-            RuntimeTransaction::<ResolvedTransactionView<_>>::try_new(
+            let resolved_tx = RuntimeTransaction::<ResolvedTransactionView<_>>::try_new(
                 sanitized_tx,
                 loaded_addresses,
                 self.get_reserved_account_keys(),
-            )
+            );
+            crate::tx_exec_timing::split_add(crate::tx_exec_timing::Step::TxResolve, timing_loaded);
+            resolved_tx
         }?;
 
+        if !self.feature_set.snapshot().loaderv3_programdata_size_floor {
+            sanitized_tx.load_implicit_read_locks();
+        }
         Ok(sanitized_tx)
     }
 

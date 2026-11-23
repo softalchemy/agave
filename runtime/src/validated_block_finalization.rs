@@ -119,8 +119,19 @@ impl ValidatedBlockFinalizationCert {
             };
 
             // Verify both certificates
-            let notar_signature = Self::verify_certificate(bank, unverified_notar_cert)?;
-            let finalize_signature = Self::verify_certificate(bank, unverified_finalize_cert)?;
+            let (notar_signature, finalize_signature) =
+                if crate::qn_flags::footer_cert_verify_parallel() {
+                    let (notar_signature, finalize_signature) = crate::qn_flags::join(
+                        || Self::verify_certificate(bank, unverified_notar_cert),
+                        || Self::verify_certificate(bank, unverified_finalize_cert),
+                    );
+                    (notar_signature?, finalize_signature?)
+                } else {
+                    (
+                        Self::verify_certificate(bank, unverified_notar_cert)?,
+                        Self::verify_certificate(bank, unverified_finalize_cert)?,
+                    )
+                };
 
             let finalize_signers =
                 Self::extract_signers(bank, finalize_cert_type, &finalize_signature.bitmap)?;
@@ -178,6 +189,40 @@ impl ValidatedBlockFinalizationCert {
     /// # Safety
     /// The caller must ensure that the provided certificates have been properly validated.
     /// Using unvalidated certificates will compromise the type's safety guarantees.
+    pub(crate) fn speculative_signers(
+        block_final_cert: &BlockFinalizationCert,
+        bank: &Bank,
+    ) -> Option<(HashSet<Pubkey>, Slot)> {
+        let block = Block {
+            slot: block_final_cert.slot,
+            block_id: block_final_cert.block_id,
+        };
+        let signers = if let Some(notar_aggregate) = &block_final_cert.notar_aggregate {
+            let finalize_signers = Self::extract_signers(
+                bank,
+                CertificateType::Finalize(block.slot),
+                block_final_cert.final_aggregate.bitmap(),
+            )
+            .ok()?;
+            let mut signers = Self::extract_signers(
+                bank,
+                CertificateType::Notarize(block),
+                notar_aggregate.bitmap(),
+            )
+            .ok()?;
+            signers.extend(finalize_signers);
+            signers
+        } else {
+            Self::extract_signers(
+                bank,
+                CertificateType::FinalizeFast(block),
+                block_final_cert.final_aggregate.bitmap(),
+            )
+            .ok()?
+        };
+        Some((signers, block.slot))
+    }
+
     pub fn from_validated_slow(
         finalize_cert: FinalizeCert,
         notarize_cert: NotarCert,
@@ -370,8 +415,10 @@ impl ValidatedBlockFinalizationCert {
         cert: UnverifiedCertificate,
     ) -> Result<CertSignature, BlockFinalizationCertError> {
         let cert_type = cert.cert_type;
-        let cert = bank
-            .verify_certificate(cert, None)
+        let verify_start = crate::slot_tail_timing::now_if_enabled();
+        let cert = bank.verify_certificate(cert, crate::qn_flags::footer_cert_aggregate_pool());
+        crate::slot_tail_timing::cert_verified(bank.slot(), verify_start);
+        let cert = cert
             .map_err(|_| BlockFinalizationCertError::CertificateVerificationFailed(cert_type))?;
         debug_assert_eq!(cert.cert_type, cert_type);
         Ok(CertSignature {

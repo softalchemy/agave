@@ -31,6 +31,7 @@ use {
     solana_clock::{BankId, Slot},
     solana_entry::{
         block_component::{ParsedBlockComponent, VersionedBlockMarker},
+        block_component_parser::{EntryStreamParser, EntryStreamStop},
         entry::{
             self, EntrySliceTickCheck as _, EntryType, EntryView, UnverifiedSignatures,
             create_ticks,
@@ -44,13 +45,17 @@ use {
     solana_runtime::{
         bank::{Bank, NewBankOptions},
         bank_forks::BankForks,
-        block_component_processor::BlockComponentProcessorError,
+        block_component_processor::{BlockComponentProcessor, BlockComponentProcessorError},
         commitment::VOTE_THRESHOLD_SIZE,
         installed_scheduler_pool::BankWithScheduler,
         leader_schedule_utils::leader_slot_index,
+        qn_flags,
         runtime_config::RuntimeConfig,
+        shred_to_tx_timing::{self, StreamCount},
+        slot_tail_timing::{self, Event},
         snapshot_controller::SnapshotController,
         transaction_execution::TransactionStatusSender,
+        tx_exec_timing::{self, Step},
         vote_sender_types::{ReplayVoteMessage, ReplayVoteSender},
     },
     solana_runtime_transaction::runtime_transaction::ReplayTransaction,
@@ -69,7 +74,7 @@ use {
         path::PathBuf,
         result,
         sync::{
-            Arc, OnceLock, RwLock,
+            Arc, Mutex, OnceLock, RwLock,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::{Duration, Instant},
@@ -202,6 +207,7 @@ fn schedule_entries_for_tests(bank: &BankWithScheduler, entries: Vec<Entry>) -> 
 
 fn process_entries(bank: &BankWithScheduler, entries: Vec<ReplayEntry>) -> Result<()> {
     let mut tick_hashes = vec![];
+    let has_entries = !entries.is_empty();
 
     for ReplayEntry {
         entry,
@@ -225,10 +231,12 @@ fn process_entries(bank: &BankWithScheduler, entries: Vec<ReplayEntry>) -> Resul
                     "no scheduler installed for bank of slot {} during replay",
                     bank.slot()
                 );
+                let timing_start = tx_exec_timing::split_start();
                 validate_entry_transactions(
                     &transactions,
                     bank.get_transaction_account_lock_limit(),
                 )?;
+                tx_exec_timing::split_add(Step::LockValidate, timing_start);
 
                 let indexes = starting_index..starting_index + transactions.len();
                 // Widening usize index to OrderedTaskId (= u128) won't ever fail.
@@ -238,10 +246,179 @@ fn process_entries(bank: &BankWithScheduler, entries: Vec<ReplayEntry>) -> Resul
             }
         }
     }
+    if has_entries {
+        slot_tail_timing::mark(bank.slot(), Event::LastEntryScheduled);
+        shred_to_tx_timing::scheduled(bank.slot());
+        tx_exec_timing::set_end(bank.slot());
+    }
     for hash in tick_hashes {
         bank.register_tick(&hash);
     }
     Ok(())
+}
+
+type VerifiedEntry = Result<(
+    EntryType<ReplayTransaction>,
+    entry::UnverifiedSignatures<Bytes>,
+)>;
+
+struct EntryVerifyJob {
+    claimed: AtomicBool,
+    done: AtomicBool,
+    entry: Mutex<Option<EntryView<Bytes>>>,
+    verified: Mutex<Option<VerifiedEntry>>,
+}
+
+struct EntryVerifyPipeline {
+    bank: Arc<Bank>,
+    jobs: Vec<EntryVerifyJob>,
+}
+
+impl EntryVerifyPipeline {
+    fn start(bank: &BankWithScheduler, entries: Vec<EntryView<Bytes>>) -> Arc<Self> {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+        let pipeline = Arc::new(Self {
+            bank: bank.clone_without_scheduler(),
+            jobs: entries
+                .into_iter()
+                .map(|entry| EntryVerifyJob {
+                    claimed: AtomicBool::new(false),
+                    done: AtomicBool::new(false),
+                    entry: Mutex::new(Some(entry)),
+                    verified: Mutex::new(None),
+                })
+                .collect(),
+        });
+        let helper = Arc::downgrade(&pipeline);
+        transaction_hash_verify_thread_pool().spawn(move || {
+            let Some(pipeline) = helper.upgrade() else {
+                return;
+            };
+            (1..pipeline.jobs.len())
+                .into_par_iter()
+                .for_each(|index| pipeline.verify(index));
+        });
+        pipeline
+    }
+
+    fn verify(&self, index: usize) {
+        let job = &self.jobs[index];
+        if job.claimed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let entry = job.entry.lock().unwrap().take().unwrap();
+        let mut unverified_signatures =
+            entry::UnverifiedSignatures::with_capacity(entry.transactions.len());
+        let verified = entry::validate_and_hash_entry_transactions(
+            entry,
+            &|unsanitized: UnsanitizedTransactionView<Bytes>| {
+                self.bank
+                    .verify_transaction(unsanitized, TransactionVerificationMode::HashOnly)
+            },
+            &mut unverified_signatures,
+        )
+        .map(|entry| (entry, unverified_signatures));
+        *job.verified.lock().unwrap() = Some(verified);
+        job.done.store(true, Ordering::Release);
+    }
+
+    fn take(&self, index: usize) -> VerifiedEntry {
+        self.verify(index);
+        let job = &self.jobs[index];
+        while !job.done.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+        job.verified.lock().unwrap().take().unwrap()
+    }
+}
+
+fn schedule_entries_incrementally<F>(
+    bank: &BankWithScheduler,
+    mut entries: Vec<EntryView<Bytes>>,
+    entry_tx_starting_indexes: &[usize],
+    num_txs: usize,
+    verify: &F,
+) -> result::Result<(entry::UnverifiedSignatures<Bytes>, Vec<Hash>), BlockstoreProcessorError>
+where
+    F: Fn(UnsanitizedTransactionView<Bytes>) -> Result<ReplayTransaction>,
+{
+    let is_vote_only_bank = bank.vote_only_bank();
+    let mut unverified_signatures = entry::UnverifiedSignatures::with_capacity(num_txs);
+    let mut tick_hashes = vec![];
+    let mut at_block_boundary = false;
+    let parallel_min = qn_flags::replay_tx_verify_parallel_min();
+    let pipeline = (parallel_min > 0
+        && num_txs >= parallel_min
+        && entries
+            .iter()
+            .filter(|entry| !entry.transactions.is_empty())
+            .nth(1)
+            .is_some())
+    .then(|| EntryVerifyPipeline::start(bank, mem::take(&mut entries)));
+    let mut entries = entries.into_iter();
+    for (index, &starting_index) in entry_tx_starting_indexes.iter().enumerate() {
+        let timing_start = tx_exec_timing::split_start();
+        let entry = if let Some(pipeline) = &pipeline {
+            if index >= pipeline.jobs.len() {
+                break;
+            }
+            pipeline.take(index).map(|(entry, mut signatures)| {
+                unverified_signatures.append(&mut signatures);
+                entry
+            })
+        } else {
+            let Some(entry) = entries.next() else {
+                break;
+            };
+            entry::validate_and_hash_entry_transactions(entry, verify, &mut unverified_signatures)
+        }
+        .inspect_err(|_| {
+            warn!(
+                "Ledger transaction hash verification failed at slot: {}",
+                bank.slot()
+            );
+        })?;
+        tx_exec_timing::split_add(Step::TxVerify, timing_start);
+        match entry {
+            EntryType::Tick(hash) => {
+                if !at_block_boundary {
+                    tick_hashes.push(hash);
+                    at_block_boundary =
+                        bank.is_block_boundary(bank.tick_height() + tick_hashes.len() as u64);
+                }
+            }
+            EntryType::Transactions(transactions) => {
+                if is_vote_only_bank
+                    && transactions
+                        .iter()
+                        .any(|tx| !is_valid_vote_only_transaction(tx))
+                {
+                    return Err(BlockstoreProcessorError::UserTransactionsInVoteOnlyBank(
+                        bank.slot(),
+                    ));
+                }
+                if at_block_boundary {
+                    continue;
+                }
+                assert!(
+                    bank.has_installed_scheduler(),
+                    "no scheduler installed for bank of slot {} during replay",
+                    bank.slot()
+                );
+                let timing_start = tx_exec_timing::split_start();
+                validate_entry_transactions(
+                    &transactions,
+                    bank.get_transaction_account_lock_limit(),
+                )?;
+                tx_exec_timing::split_add(Step::LockValidate, timing_start);
+                let indexes = starting_index..starting_index + transactions.len();
+                let task_ids = indexes.map(|i| i.try_into().unwrap());
+                bank.schedule_transaction_executions(transactions.into_iter().zip_eq(task_ids))?;
+            }
+        }
+    }
+    Ok((unverified_signatures, tick_hashes))
 }
 
 /// Validate an entry's transactions before scheduling: each transaction's account
@@ -937,6 +1114,173 @@ pub struct ConfirmationProgress {
     pub num_entries: usize,
     pub num_txs: usize,
     async_verification: Option<AsyncVerificationProgress>,
+    streaming: Option<Box<StreamingProgress>>,
+}
+
+#[derive(Default)]
+struct StreamingProgress {
+    set_start: u64,
+    num_shreds: u64,
+    parser: EntryStreamParser,
+    batch_started: bool,
+    stopped: bool,
+    entries: Vec<(u64, Hash, usize)>,
+    tx_bytes: Vec<u8>,
+    num_txs: usize,
+    releases: Vec<(u64, u32)>,
+}
+
+fn stream_mismatch(slot: Slot, range_start: u32) -> BlockstoreProcessorError {
+    warn!("slot {slot}: streamed entries differ from the data set at shred {range_start}");
+    shred_to_tx_timing::stream_count(slot, StreamCount::Mismatch, 1);
+    BlockstoreProcessorError::FailedToLoadEntries(BlockstoreError::InvalidShredData(format!(
+        "streamed entries differ from the data set at shred {range_start}"
+    )))
+}
+
+fn reconcile_streamed(
+    slot: Slot,
+    completed_range: &Range<u32>,
+    stream: &StreamingProgress,
+    mut entries: Vec<EntryView<Bytes>>,
+) -> result::Result<Vec<EntryView<Bytes>>, BlockstoreProcessorError> {
+    let mut tx_bytes = stream.tx_bytes.as_slice();
+    let matches = stream.set_start == u64::from(completed_range.start)
+        && stream.num_shreds <= u64::from(completed_range.end - completed_range.start)
+        && stream.entries.len() <= entries.len()
+        && stream
+            .entries
+            .iter()
+            .zip(&entries)
+            .all(|((num_hashes, hash, num_txs), entry)| {
+                entry.num_hashes == *num_hashes
+                    && entry.hash == *hash
+                    && entry.transactions.len() == *num_txs
+                    && entry.transactions.iter().all(|transaction| {
+                        let data = transaction.data();
+                        tx_bytes
+                            .split_at_checked(data.len())
+                            .is_some_and(|(head, tail)| {
+                                tx_bytes = tail;
+                                head == data
+                            })
+                    })
+            })
+        && tx_bytes.is_empty();
+    if !matches {
+        return Err(stream_mismatch(slot, completed_range.start));
+    }
+    entries.drain(..stream.entries.len());
+    shred_to_tx_timing::stream_set_done(
+        slot,
+        completed_range.end,
+        &stream.releases,
+        entries.iter().map(|entry| entry.transactions.len()).sum(),
+    );
+    Ok(entries)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_partial_data_set(
+    blockstore: &Blockstore,
+    bank: &BankWithScheduler,
+    processor: &mut BlockComponentProcessor,
+    replay_verification_worker_pool: &ReplayVerificationWorkerPool,
+    timing: &mut ConfirmationTiming,
+    progress: &mut ConfirmationProgress,
+    skip_verification: bool,
+    entry_notification_sender: Option<&EntryNotifierSender>,
+    replay_vote_sender: Option<&ReplayVoteSender>,
+    migration_status: &MigrationStatus,
+) -> result::Result<(), BlockstoreProcessorError> {
+    let slot = bank.slot();
+    let set_start = progress.num_shreds;
+    let mut stream = match progress.streaming.take() {
+        Some(stream) if stream.set_start == set_start => stream,
+        Some(stream) if !stream.entries.is_empty() => {
+            return Err(stream_mismatch(slot, stream.set_start as u32));
+        }
+        _ => Box::new(StreamingProgress {
+            set_start,
+            ..StreamingProgress::default()
+        }),
+    };
+    while !stream.stopped {
+        let Some(data) =
+            blockstore.take_stream_data(slot, set_start, set_start + stream.num_shreds)
+        else {
+            break;
+        };
+        let num_shreds = (data.range.end - data.range.start) as usize;
+        stream.num_shreds += num_shreds as u64;
+        shred_to_tx_timing::stream_count(slot, StreamCount::Chunks, 1);
+        shred_to_tx_timing::stream_count(slot, StreamCount::ChunksPulled, data.pulled as usize);
+        shred_to_tx_timing::stream_count(slot, StreamCount::Shreds, num_shreds);
+        let entries = stream.parser.push(&data.data);
+        stream.stopped = stream.parser.is_complete();
+        if let Some(stop) = stream.parser.stop() {
+            stream.stopped = true;
+            let count = match stop {
+                EntryStreamStop::BlockMarker => StreamCount::StopMarker,
+                EntryStreamStop::EntryCount => StreamCount::StopEntryCount,
+                EntryStreamStop::Tick => StreamCount::StopTick,
+                EntryStreamStop::Oversize => StreamCount::StopOversize,
+            };
+            shred_to_tx_timing::stream_count(slot, count, 1);
+        }
+        if entries.is_empty() {
+            continue;
+        }
+        if !stream.batch_started {
+            if processor
+                .on_entry_batch(migration_status, slot, &entries, false)
+                .is_err()
+            {
+                stream.stopped = true;
+                shred_to_tx_timing::stream_count(slot, StreamCount::StopComponent, 1);
+                break;
+            }
+            stream.batch_started = true;
+        }
+        let mut num_txs = 0;
+        for entry in &entries {
+            stream
+                .entries
+                .push((entry.num_hashes, entry.hash, entry.transactions.len()));
+            for transaction in &entry.transactions {
+                stream.tx_bytes.extend_from_slice(transaction.data());
+            }
+            num_txs += entry.transactions.len();
+        }
+        stream.num_txs += num_txs;
+        let released =
+            shred_to_tx_timing::stream_released(slot, progress.num_txs, entries.len(), num_txs);
+        if released != 0 {
+            stream.releases.push((released, num_txs as u32));
+        }
+        if qn_flags::replay_account_prefetch() {
+            solana_runtime::account_prefetch::spawn(
+                bank.clone_without_scheduler(),
+                entries
+                    .iter()
+                    .flat_map(|entry| entry.transactions.iter().cloned())
+                    .collect(),
+            );
+        }
+        confirm_slot_entries(
+            bank,
+            replay_verification_worker_pool,
+            (entries, 0, false),
+            timing,
+            progress,
+            skip_verification,
+            entry_notification_sender,
+            replay_vote_sender,
+            migration_status,
+        )?;
+    }
+    progress.streaming = Some(stream);
+    Ok(())
 }
 
 impl ConfirmationProgress {
@@ -1403,9 +1747,68 @@ pub fn confirm_slot(
     allow_dead_slots: bool,
     migration_status: &MigrationStatus,
 ) -> result::Result<(), BlockstoreProcessorError> {
-    let slot = bank.slot();
+    let footer_without_final_component = confirm_slot_once(
+        blockstore,
+        bank,
+        shred_version,
+        replay_verification_worker_pool,
+        timing,
+        progress,
+        skip_verification,
+        entry_notification_sender,
+        replay_vote_sender,
+        finalization_cert_sender,
+        allow_dead_slots,
+        migration_status,
+    )?;
+    if footer_without_final_component && qn_flags::replay_refetch_after_footer() {
+        confirm_slot_once(
+            blockstore,
+            bank,
+            shred_version,
+            replay_verification_worker_pool,
+            timing,
+            progress,
+            skip_verification,
+            entry_notification_sender,
+            replay_vote_sender,
+            finalization_cert_sender,
+            allow_dead_slots,
+            migration_status,
+        )?;
+    }
+    Ok(())
+}
 
-    let (slot_components, completed_ranges, slot_full) = {
+#[allow(clippy::too_many_arguments)]
+fn confirm_slot_once(
+    blockstore: &Blockstore,
+    bank: &BankWithScheduler,
+    shred_version: u16,
+    replay_verification_worker_pool: &ReplayVerificationWorkerPool,
+    timing: &mut ConfirmationTiming,
+    progress: &mut ConfirmationProgress,
+    skip_verification: bool,
+    entry_notification_sender: Option<&EntryNotifierSender>,
+    replay_vote_sender: Option<&ReplayVoteSender>,
+    finalization_cert_sender: Option<&Sender<SmallVec<[Certificate; 2]>>>,
+    allow_dead_slots: bool,
+    migration_status: &MigrationStatus,
+) -> result::Result<bool, BlockstoreProcessorError> {
+    let slot = bank.slot();
+    let mut footer_without_final_component = false;
+
+    let fast_components = (qn_flags::replay_entries_fast_path() && !allow_dead_slots)
+        .then(|| blockstore.take_fast_components(slot, progress.num_shreds))
+        .flatten();
+    let fetched_fast = fast_components.is_some();
+    let (slot_components, completed_ranges, slot_full) = if let Some((
+        slot_components,
+        completed_ranges,
+    )) = fast_components
+    {
+        Ok((slot_components, completed_ranges, false))
+    } else {
         let mut load_elapsed = Measure::start("load_elapsed");
         let load_result = blockstore
             .get_slot_component_views_with_shred_info(slot, progress.num_shreds, allow_dead_slots)
@@ -1418,6 +1821,23 @@ pub fn confirm_slot(
         }
         load_result
     }?;
+    slot_tail_timing::mark(slot, Event::EntriesFetched);
+    shred_to_tx_timing::fetched(slot, &completed_ranges, fetched_fast);
+    tx_exec_timing::fetched();
+    if qn_flags::replay_account_prefetch() {
+        solana_runtime::account_prefetch::spawn(
+            bank.clone_without_scheduler(),
+            slot_components
+                .iter()
+                .filter_map(|component| match component {
+                    ParsedBlockComponent::EntryBatch(entries) => Some(entries),
+                    ParsedBlockComponent::BlockMarker(_) => None,
+                })
+                .flatten()
+                .flat_map(|entry| entry.transactions.iter().cloned())
+                .collect(),
+        );
+    }
 
     // Process block components for Alpenglow slots. Note that we don't need to run migration checks
     // for BlockMarkers here, despite BlockMarkers only being active post-Alpenglow. Here's why:
@@ -1458,10 +1878,20 @@ pub fn confirm_slot(
     {
         let num_shreds = completed_range.end - completed_range.start;
         let is_final = slot_full && ix == completed_ranges.len() - 1;
+        let streamed = progress
+            .streaming
+            .take()
+            .filter(|stream| !stream.entries.is_empty());
 
         match component {
             ParsedBlockComponent::EntryBatch(entries) => {
                 let slot_full = slot_full && ix == last_entry_batch_index.unwrap();
+                if qn_flags::tx_exec_timing() {
+                    tx_exec_timing::set_begin(
+                        slot,
+                        entries.iter().map(|entry| entry.transactions.len()).sum(),
+                    );
+                }
 
                 // Skip block component validation for genesis block. Slot 0 is handled specially,
                 // since it won't have the required block markers.
@@ -1476,6 +1906,18 @@ pub fn confirm_slot(
                         })?;
                 }
 
+                if qn_flags::shred_to_tx_timing() {
+                    shred_to_tx_timing::entry_batch(
+                        slot,
+                        completed_range.end,
+                        progress.num_txs - streamed.as_ref().map_or(0, |stream| stream.num_txs),
+                        entries.iter().map(|entry| entry.transactions.len()).sum(),
+                    );
+                }
+                let entries = match streamed {
+                    Some(stream) => reconcile_streamed(slot, completed_range, &stream, entries)?,
+                    None => entries,
+                };
                 confirm_slot_entries(
                     bank,
                     replay_verification_worker_pool,
@@ -1489,9 +1931,13 @@ pub fn confirm_slot(
                 )?;
             }
             ParsedBlockComponent::BlockMarker(marker) => {
+                if streamed.is_some() {
+                    return Err(stream_mismatch(slot, completed_range.start));
+                }
                 let block_footer = match &marker {
                     VersionedBlockMarker::V1(marker) => marker.as_block_footer().cloned(),
                 };
+                footer_without_final_component = block_footer.is_some() && !slot_full;
                 if let Some(parent_bank) = bank.parent() {
                     let allow_initial_update_parent =
                         replay_starts_at_update_parent && marker.is_update_parent();
@@ -1547,7 +1993,27 @@ pub fn confirm_slot(
         }
     }
 
-    Ok(())
+    if qn_flags::replay_streaming()
+        && !allow_dead_slots
+        && !slot_full
+        && slot != 0
+        && bank.tick_height() < bank.max_tick_height()
+    {
+        stream_partial_data_set(
+            blockstore,
+            bank,
+            &mut processor,
+            replay_verification_worker_pool,
+            timing,
+            progress,
+            skip_verification,
+            entry_notification_sender,
+            replay_vote_sender,
+            migration_status,
+        )?;
+    }
+
+    Ok(footer_without_final_component)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1583,6 +2049,9 @@ fn confirm_slot_entries(
         bank.set_accounts_lt_hash_async_progress_is_at_end();
     }
     let num_entries = entries.len();
+    slot_tail_timing::entries(slot, num_entries);
+    slot_tail_timing::mark(slot, Event::EntryBatchStart);
+    tx_exec_timing::mark(Step::OnEntryBatch);
     let mut entry_tx_starting_indexes = Vec::with_capacity(num_entries);
     let mut entry_tx_starting_index = progress.num_txs;
     let num_txs = entries
@@ -1640,7 +2109,12 @@ fn confirm_slot_entries(
         )?;
     }
 
+    slot_tail_timing::mark(slot, Event::TicksVerified);
+    tx_exec_timing::mark(Step::Ticks);
     let last_entry_hash = entries.last().map(|e| e.hash);
+    let schedule_per_entry =
+        qn_flags::replay_schedule_per_entry() && num_txs < entry::PARALLEL_VERIFY_THRESHOLD;
+    let mut deferred_poh_verification = None;
     if !skip_verification {
         let start_hash = progress.last_entry;
         let verify_entries = entry::entry_views_to_verification_data(&entries);
@@ -1648,16 +2122,22 @@ fn confirm_slot_entries(
             "verify-batch-size",
             ("size", verify_entries.len() as i64, i64)
         );
-        progress
-            .async_verification(replay_verification_worker_pool)
-            .spawn_poh_verification(
-                replay_verification_worker_pool,
-                verify_entries,
-                start_hash,
-                slot,
-            )?;
+        if schedule_per_entry && qn_flags::replay_poh_spawn_after_schedule() {
+            deferred_poh_verification = Some((verify_entries, start_hash));
+        } else {
+            progress
+                .async_verification(replay_verification_worker_pool)
+                .spawn_poh_verification(
+                    replay_verification_worker_pool,
+                    verify_entries,
+                    start_hash,
+                    slot,
+                )?;
+        }
     }
 
+    slot_tail_timing::mark(slot, Event::PohSpawned);
+    tx_exec_timing::mark(Step::PohSpawn);
     let validate_and_hash_transaction = {
         let bank = bank.clone_with_scheduler();
         move |unsanitized: UnsanitizedTransactionView<Bytes>| {
@@ -1665,6 +2145,36 @@ fn confirm_slot_entries(
         }
     };
 
+    let (entries, scheduled_incrementally) = if schedule_per_entry {
+        let mut replay_timer = Measure::start("replay_elapsed");
+        let scheduled = schedule_entries_incrementally(
+            bank,
+            entries,
+            &entry_tx_starting_indexes,
+            num_txs,
+            &validate_and_hash_transaction,
+        );
+        replay_timer.stop();
+        *replay_elapsed += replay_timer.as_us();
+        slot_tail_timing::mark(slot, Event::LastEntryScheduled);
+        shred_to_tx_timing::scheduled(slot);
+        tx_exec_timing::set_end(slot);
+        if let Some((verify_entries, start_hash)) = deferred_poh_verification {
+            progress
+                .async_verification(replay_verification_worker_pool)
+                .spawn_poh_verification(
+                    replay_verification_worker_pool,
+                    verify_entries,
+                    start_hash,
+                    slot,
+                )?;
+        }
+        (vec![], Some(scheduled?))
+    } else {
+        (entries, None)
+    };
+
+    let timing_start = tx_exec_timing::split_start();
     let entry::ValidatedHashedTransactions {
         entries,
         unverified_signatures,
@@ -1683,6 +2193,9 @@ fn confirm_slot_entries(
             return Err(err.into());
         }
     };
+    tx_exec_timing::split_add(Step::TxVerify, timing_start);
+    let (unverified_signatures, scheduled_tick_hashes) =
+        scheduled_incrementally.unwrap_or((unverified_signatures, vec![]));
     let bank_id = bank.bank_id();
     if skip_verification {
         if let Some(replay_vote_sender) = replay_vote_sender {
@@ -1697,6 +2210,7 @@ fn confirm_slot_entries(
         }
     } else {
         let replay_vote_sender = replay_vote_sender.cloned();
+        let timing_start = tx_exec_timing::split_start();
         progress
             .async_verification(replay_verification_worker_pool)
             .spawn_signature_verification(
@@ -1706,9 +2220,13 @@ fn confirm_slot_entries(
                 bank_id,
                 replay_vote_sender,
             )?;
+        tx_exec_timing::split_add(Step::SigSpawn, timing_start);
     }
 
     let mut replay_timer = Measure::start("replay_elapsed");
+    for hash in scheduled_tick_hashes {
+        bank.register_tick(&hash);
+    }
     let is_vote_only_bank = bank.vote_only_bank();
     let replay_entries: Vec<_> = entries
         .into_iter()
@@ -1740,6 +2258,7 @@ fn confirm_slot_entries(
 
     let process_result =
         process_entries(bank, replay_entries).map_err(BlockstoreProcessorError::from);
+    slot_tail_timing::mark(slot, Event::SchedulerDrained);
     replay_timer.stop();
     *replay_elapsed += replay_timer.as_us();
 
@@ -5138,6 +5657,274 @@ pub mod tests {
                 *genesis_hash,
             )),
         ]
+    }
+
+    fn streamed_fixture(
+        entries: &[EntryView<Bytes>],
+        set_start: u64,
+        num_shreds: u64,
+    ) -> StreamingProgress {
+        let mut stream = StreamingProgress {
+            set_start,
+            num_shreds,
+            ..StreamingProgress::default()
+        };
+        for entry in entries {
+            stream
+                .entries
+                .push((entry.num_hashes, entry.hash, entry.transactions.len()));
+            for transaction in &entry.transactions {
+                stream.tx_bytes.extend_from_slice(transaction.data());
+            }
+            stream.num_txs += entry.transactions.len();
+        }
+        stream
+    }
+
+    #[test]
+    fn test_reconcile_streamed_accounting() {
+        let keypair = Keypair::new();
+        let mut hash = Hash::new_unique();
+        let entries: Vec<Entry> = (0..4)
+            .map(|index| {
+                let transactions = (0..=index)
+                    .map(|amount| {
+                        system_transaction::transfer(
+                            &keypair,
+                            &Pubkey::new_unique(),
+                            amount + 1,
+                            Hash::new_unique(),
+                        )
+                    })
+                    .collect();
+                next_entry_mut(&mut hash, 1, transactions)
+            })
+            .collect();
+        let views = || entry_views_for_tests(entries.clone());
+        for streamed in 0..=4 {
+            let stream = streamed_fixture(&views()[..streamed], 32, 5);
+            assert_eq!(stream.num_txs, (1..=streamed).sum::<usize>());
+            let rest = reconcile_streamed(7, &(32..64), &stream, views()).unwrap();
+            assert_eq!(rest.len(), 4 - streamed);
+            for (rest, whole) in rest.iter().zip(&views()[streamed..]) {
+                assert_eq!(rest.hash, whole.hash);
+                assert_eq!(rest.transactions.len(), whole.transactions.len());
+            }
+        }
+        let stream = streamed_fixture(&views()[..2], 32, 5);
+        assert!(reconcile_streamed(7, &(33..64), &stream, views()).is_err());
+        assert!(reconcile_streamed(7, &(32..36), &stream, views()).is_err());
+        let truncated = views().into_iter().take(1).collect();
+        assert!(reconcile_streamed(7, &(32..64), &stream, truncated).is_err());
+        let mut tampered = streamed_fixture(&views()[..2], 32, 5);
+        *tampered.tx_bytes.last_mut().unwrap() ^= 1;
+        assert!(reconcile_streamed(7, &(32..64), &tampered, views()).is_err());
+        let mut tampered = streamed_fixture(&views()[..2], 32, 5);
+        tampered.tx_bytes.push(0);
+        assert!(reconcile_streamed(7, &(32..64), &tampered, views()).is_err());
+        let mut tampered = streamed_fixture(&views()[..2], 32, 5);
+        tampered.entries[1].1 = Hash::new_unique();
+        assert!(reconcile_streamed(7, &(32..64), &tampered, views()).is_err());
+        let mut tampered = streamed_fixture(&views()[..2], 32, 5);
+        tampered.entries[0].0 += 1;
+        assert!(reconcile_streamed(7, &(32..64), &tampered, views()).is_err());
+        let mut reordered = views();
+        reordered.swap(0, 1);
+        assert!(reconcile_streamed(7, &(32..64), &stream, reordered).is_err());
+    }
+
+    #[test]
+    fn test_confirm_slot_streaming_matches_whole_data_sets() {
+        if !qn_flags::replay_streaming() {
+            return;
+        }
+        let GenesisConfigInfo {
+            genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config(1_000 * LAMPORTS_PER_SOL);
+        let ticks_per_slot = {
+            let (bank0, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+            let bank1 = Bank::new_from_parent(bank0, SlotLeader::default(), 1);
+            bank1.max_tick_height() - bank1.tick_height()
+        };
+        let amount = genesis_config.rent.minimum_balance(0);
+        let blockhash = Bank::new_for_tests(&genesis_config).last_blockhash();
+        let payers = [Keypair::new(), Keypair::new(), Keypair::new()];
+        let mut hash = blockhash;
+        let mut tx_entries = |count: u64, salt: u64| -> Vec<Entry> {
+            (0..count)
+                .map(|index| {
+                    let transactions = (0..1 + index % 3)
+                        .map(|position| {
+                            system_transaction::transfer(
+                                &payers[position as usize],
+                                &Pubkey::new_unique(),
+                                amount + salt + index * 4 + position,
+                                blockhash,
+                            )
+                        })
+                        .collect();
+                    next_entry_mut(&mut hash, 1, transactions)
+                })
+                .collect()
+        };
+        let first = tx_entries(90, 0);
+        let second = tx_entries(40, 1_000);
+        let mut third = tx_entries(6, 2_000);
+        let third_txs: usize = third.iter().map(|entry| entry.transactions.len()).sum();
+        third.extend(create_ticks(ticks_per_slot, 0, hash));
+        let leader = Keypair::new();
+        let shredder = Shredder::new(1, 0, 0, 0).unwrap();
+        let reed_solomon_cache = ReedSolomonCache::default();
+        let mut data_sets: Vec<Vec<Shred>> = vec![];
+        let mut chained_merkle_root = Hash::new_unique();
+        let (mut next_shred_index, mut next_code_index) = (0, 0);
+        for (entries, is_last_in_slot) in [(&first, false), (&second, false), (&third, true)] {
+            let (data, coding) = shredder.entries_to_merkle_shreds_for_tests(
+                &leader,
+                entries,
+                is_last_in_slot,
+                chained_merkle_root,
+                next_shred_index,
+                next_code_index,
+                &reed_solomon_cache,
+                &mut ProcessShredsStats::default(),
+            );
+            chained_merkle_root = data.last().unwrap().merkle_root().unwrap();
+            next_shred_index += data.len() as u32;
+            next_code_index += coding.len() as u32;
+            data_sets.push(data);
+        }
+        assert!(data_sets[0].len() > 32);
+        let all_shreds: Vec<Shred> = data_sets.iter().flatten().cloned().collect();
+        let expected_txs_after = |num_shreds: usize| -> (u64, usize) {
+            let mut start = 0;
+            let mut complete_shreds = 0;
+            let mut txs = 0;
+            for (shreds, entries) in data_sets.iter().zip([&first, &second, &third]) {
+                let available = num_shreds.saturating_sub(start).min(shreds.len());
+                if available == shreds.len() {
+                    complete_shreds += shreds.len() as u64;
+                    txs += entries
+                        .iter()
+                        .map(|entry| entry.transactions.len())
+                        .sum::<usize>();
+                } else {
+                    let bytes: usize = shreds[..available]
+                        .iter()
+                        .map(|shred| {
+                            let payload: &[u8] = shred.payload().as_ref();
+                            crate::shred::layout::get_data(payload).unwrap().len()
+                        })
+                        .sum();
+                    let mut end = 8;
+                    for entry in entries.iter() {
+                        end += wincode::serialize(entry).unwrap().len();
+                        if end > bytes || entry.transactions.is_empty() {
+                            break;
+                        }
+                        txs += entry.transactions.len();
+                    }
+                    break;
+                }
+                start += shreds.len();
+            }
+            (complete_shreds, txs)
+        };
+        let replay = |steps: Vec<usize>| {
+            let ledger_path = get_tmp_ledger_path_auto_delete!();
+            let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+            let (bank0, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+            for payer in &payers {
+                bank0
+                    .transfer(100 * LAMPORTS_PER_SOL, &mint_keypair, &payer.pubkey())
+                    .unwrap();
+            }
+            let bank1 = Arc::new(Bank::new_from_parent(bank0, SlotLeader::default(), 1));
+            let pool = DefaultSchedulerPool::new_for_verification(None, None, None, None, None);
+            let bank1 = take_bank_with_scheduler_for_tests(&pool, bank1);
+            let replay_verification_worker_pool = ReplayVerificationWorkerPool::new(1);
+            let mut progress = ConfirmationProgress::new(blockhash);
+            let mut shreds = all_shreds.clone().into_iter();
+            let mut inserted = 0;
+            let mut partial_releases = 0;
+            for step in steps {
+                let batch: Vec<Shred> = shreds.by_ref().take(step).collect();
+                inserted += batch.len();
+                blockstore.insert_shreds(batch, false).unwrap();
+                confirm_slot(
+                    &blockstore,
+                    &bank1,
+                    0,
+                    &replay_verification_worker_pool,
+                    &mut ConfirmationTiming::default(),
+                    &mut progress,
+                    false,
+                    None,
+                    None,
+                    None,
+                    false,
+                    &MigrationStatus::default(),
+                )
+                .unwrap();
+                let (complete_shreds, txs) = expected_txs_after(inserted);
+                assert_eq!(
+                    progress.num_shreds, complete_shreds,
+                    "after {inserted} shreds"
+                );
+                assert_eq!(progress.num_txs, txs, "after {inserted} shreds");
+                let streamed_txs = progress
+                    .streaming
+                    .as_ref()
+                    .map_or(0, |stream| stream.num_txs);
+                partial_releases += (streamed_txs > 0) as usize;
+            }
+            assert_eq!(inserted, all_shreds.len());
+            let (wait_result, _timings) = bank1.wait_for_completed_scheduler().unwrap();
+            wait_result.unwrap();
+            progress
+                .wait_for_all_verification_results(&mut 0, &mut 0)
+                .unwrap();
+            assert!(bank1.is_complete());
+            assert!(progress.streaming.is_none());
+            bank1.freeze();
+            (
+                (
+                    progress.num_shreds,
+                    progress.num_entries,
+                    progress.num_txs,
+                    progress.last_entry,
+                    progress.tick_hash_count,
+                ),
+                bank1.hash(),
+                bank1.signature_count(),
+                partial_releases,
+            )
+        };
+        let (whole_progress, whole_hash, whole_signatures, whole_partial) =
+            replay(vec![all_shreds.len()]);
+        assert_eq!(whole_partial, 0);
+        assert_eq!(whole_progress.0, all_shreds.len() as u64);
+        assert_eq!(
+            whole_progress.1,
+            first.len() + second.len() + third.len()
+        );
+        for step in [1, 2, 5, 31, 33] {
+            let (progress, hash, signatures, partial) =
+                replay(vec![step; all_shreds.len().div_ceil(step)]);
+            assert_eq!(progress, whole_progress, "step {step}");
+            assert_eq!(hash, whole_hash, "step {step}");
+            assert_eq!(signatures, whole_signatures, "step {step}");
+            assert!(partial > 0, "step {step}");
+        }
+        let (progress, hash, _, partial) = replay(vec![
+            data_sets[0].len() + data_sets[1].len() + data_sets[2].len() - 1,
+            1,
+        ]);
+        assert_eq!(progress, whole_progress);
+        assert_eq!(hash, whole_hash);
+        assert_eq!(partial, (third_txs > 0) as usize);
     }
 
     #[test]

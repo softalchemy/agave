@@ -2588,6 +2588,222 @@ fn test_iter_bounds() {
 }
 
 #[test]
+fn test_stream_range() {
+    assert_eq!(Blockstore::stream_range(false, 0, 5, 0), None);
+    assert_eq!(Blockstore::stream_range(true, 0, 5, 0), Some(0..5));
+    assert_eq!(Blockstore::stream_range(true, 3, 5, 0), Some(3..5));
+    assert_eq!(Blockstore::stream_range(true, 3, 40, 32), Some(32..40));
+    assert_eq!(Blockstore::stream_range(true, 35, 40, 32), Some(35..40));
+    assert_eq!(Blockstore::stream_range(true, 3, 32, 32), None);
+    assert_eq!(Blockstore::stream_range(true, 40, 40, 32), None);
+}
+
+#[test]
+fn test_stream_data_matches_data_set_prefix() {
+    let slot = 1;
+    let leader_keypair = Keypair::new();
+    let shredder = Shredder::new(slot, 0, 0, 0).unwrap();
+    let reed_solomon_cache = ReedSolomonCache::default();
+    let (first_data, first_coding) = shredder.entries_to_merkle_shreds_for_tests(
+        &leader_keypair,
+        &make_slot_entries_with_transactions(3),
+        false,
+        Hash::new_unique(),
+        0,
+        0,
+        &reed_solomon_cache,
+        &mut ProcessShredsStats::default(),
+    );
+    let set_start = first_data.len() as u32;
+    let (data, coding) = shredder.entries_to_merkle_shreds_for_tests(
+        &leader_keypair,
+        &make_slot_entries_with_transactions(400),
+        false,
+        first_data.last().unwrap().merkle_root().unwrap(),
+        set_start,
+        first_coding.len() as u32,
+        &reed_solomon_cache,
+        &mut ProcessShredsStats::default(),
+    );
+    assert!(data.len() > 97);
+    let payload = Shredder::deshred(data.iter().map(Shred::payload)).unwrap();
+    let prefix_len = |num_shreds: usize| -> usize {
+        data[..num_shreds]
+            .iter()
+            .map(|shred| {
+                let payload: &[u8] = shred.payload().as_ref();
+                shred::layout::get_data(payload).unwrap().len()
+            })
+            .sum()
+    };
+    assert_eq!(prefix_len(data.len()), payload.len());
+    let drain = |blockstore: &Blockstore, streamed: &mut Vec<u8>, num_shreds: &mut u32| {
+        let mut pulls = 0;
+        while let Some(stream) = blockstore.take_stream_data(
+            slot,
+            u64::from(set_start),
+            u64::from(set_start + *num_shreds),
+        ) {
+            assert!(stream.pulled);
+            assert_eq!(stream.range.start, set_start + *num_shreds);
+            *num_shreds += stream.range.end - stream.range.start;
+            streamed.extend_from_slice(&stream.data);
+            pulls += 1;
+        }
+        assert!(pulls <= 1);
+    };
+    let check = |streamed: &[u8], num_shreds: u32, expected_shreds: usize| {
+        assert_eq!(num_shreds as usize, expected_shreds);
+        assert_eq!(streamed, &payload[..prefix_len(expected_shreds)]);
+    };
+
+    let ledger_path = get_tmp_ledger_path_auto_delete!();
+    let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+    let (mut streamed, mut num_shreds) = (vec![], 0);
+    blockstore
+        .insert_shreds(vec![data[0].clone()], false)
+        .unwrap();
+    drain(&blockstore, &mut streamed, &mut num_shreds);
+    check(&streamed, num_shreds, 0);
+    blockstore.insert_shreds(first_data.clone(), false).unwrap();
+    drain(&blockstore, &mut streamed, &mut num_shreds);
+    check(&streamed, num_shreds, 1);
+    assert!(
+        blockstore
+            .take_stream_data(slot, u64::from(set_start) + 1, u64::from(set_start) + 1)
+            .is_none()
+    );
+    assert!(blockstore.take_stream_data(slot, 0, 0).is_none());
+    for (position, shred) in data.iter().enumerate().skip(1).take(data.len() - 2) {
+        blockstore
+            .insert_shreds(vec![shred.clone()], false)
+            .unwrap();
+        drain(&blockstore, &mut streamed, &mut num_shreds);
+        check(&streamed, num_shreds, position + 1);
+    }
+    blockstore
+        .insert_shreds(vec![data.last().unwrap().clone()], false)
+        .unwrap();
+    drain(&blockstore, &mut streamed, &mut num_shreds);
+    check(&streamed, num_shreds, data.len() - 1);
+
+    let ledger_path = get_tmp_ledger_path_auto_delete!();
+    let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+    let mut pinnable_slice = blockstore.new_pinnable_slice();
+    let mut write_batch = blockstore.get_write_batch();
+    let genesis_config = create_genesis_config(2).genesis_config;
+    let root_bank = Arc::new(Bank::new_for_tests(&genesis_config));
+    let (dummy_retransmit_sender, _) = EvictingSender::new_bounded(0);
+    let mut shred_recovery_context = ShredRecoveryContext::new(
+        ReedSolomonCache::default(),
+        dummy_retransmit_sender,
+        root_bank,
+        0,
+    );
+    let mut receive = |shreds: Vec<Shred>| {
+        blockstore
+            .do_insert_shreds(
+                shreds.into_iter().map(|shred| {
+                    (
+                        Cow::Owned(shred),
+                        /*is_repaired:*/ false,
+                        BlockLocation::Original,
+                    )
+                }),
+                false,
+                Some(&mut shred_recovery_context),
+                &mut pinnable_slice,
+                &mut write_batch,
+                &mut BlockstoreInsertionMetrics::default(),
+            )
+            .unwrap();
+    };
+    let fec_coding = |fec_set: usize| -> Vec<Shred> {
+        coding
+            .iter()
+            .filter(|shred| shred.fec_set_index() == set_start + 32 * fec_set as u32)
+            .cloned()
+            .collect()
+    };
+    let (mut streamed, mut num_shreds) = (vec![], 0);
+    receive(first_data.clone());
+    receive(
+        data[..32]
+            .iter()
+            .filter(|shred| shred.index() != set_start + 5)
+            .cloned()
+            .collect(),
+    );
+    drain(&blockstore, &mut streamed, &mut num_shreds);
+    check(&streamed, num_shreds, 5);
+    receive(data[40..50].to_vec());
+    drain(&blockstore, &mut streamed, &mut num_shreds);
+    check(&streamed, num_shreds, 5);
+    receive(fec_coding(0)[..1].to_vec());
+    drain(&blockstore, &mut streamed, &mut num_shreds);
+    check(&streamed, num_shreds, 32);
+    receive(fec_coding(1)[..21].to_vec());
+    drain(&blockstore, &mut streamed, &mut num_shreds);
+    check(&streamed, num_shreds, 32);
+    receive(fec_coding(1)[21..22].to_vec());
+    drain(&blockstore, &mut streamed, &mut num_shreds);
+    check(&streamed, num_shreds, 64);
+    receive(fec_coding(2));
+    drain(&blockstore, &mut streamed, &mut num_shreds);
+    assert!(data.len() > 97);
+    check(&streamed, num_shreds, 96);
+    receive(data[96..data.len() - 1].to_vec());
+    blockstore.set_dead_slot(slot).unwrap();
+    assert!(
+        blockstore
+            .take_stream_data(
+                slot,
+                u64::from(set_start),
+                u64::from(set_start + num_shreds)
+            )
+            .is_none()
+    );
+    blockstore.remove_dead_slot(slot).unwrap();
+    drain(&blockstore, &mut streamed, &mut num_shreds);
+    check(&streamed, num_shreds, data.len() - 1);
+    receive(data[data.len() - 1..].to_vec());
+    drain(&blockstore, &mut streamed, &mut num_shreds);
+    check(&streamed, num_shreds, data.len() - 1);
+}
+
+#[test]
+fn test_fast_path_ranges() {
+    let completed: CompletedDataIndexes = [2, 4, 9, 11].iter().copied().collect();
+    let ranges = |old_consumed, consumed, last_index| {
+        Blockstore::fast_path_ranges(&completed, old_consumed, consumed, last_index)
+    };
+    assert_eq!(ranges(0, 1, None), (vec![], 0));
+    assert_eq!(ranges(0, 3, None), (vec![0..3], 3));
+    assert_eq!(ranges(1, 3, None), (vec![0..3], 3));
+    assert_eq!(ranges(3, 5, None), (vec![3..5], 5));
+    assert_eq!(ranges(4, 5, None), (vec![3..5], 5));
+    assert_eq!(ranges(1, 10, None), (vec![0..3, 3..5, 5..10], 10));
+    assert_eq!(ranges(5, 8, None), (vec![], 5));
+    assert_eq!(ranges(7, 10, None), (vec![5..10], 10));
+    assert_eq!(ranges(10, 10, None), (vec![], 10));
+    assert_eq!(ranges(10, 12, None), (vec![10..12], 12));
+    assert_eq!(ranges(10, 12, Some(11)), (vec![], 12));
+    assert_eq!(ranges(3, 12, Some(11)), (vec![3..5, 5..10], 12));
+    assert_eq!(ranges(0, 12, Some(11)), (vec![0..3, 3..5, 5..10], 12));
+    assert_eq!(ranges(0, 12, Some(20)), (vec![0..3, 3..5, 5..10, 10..12], 12));
+    let valid = |consumed: &u32| !completed.contains(consumed);
+    for old_consumed in (0..=12).filter(valid) {
+        for consumed in (old_consumed..=12).filter(valid) {
+            let (fast, end) = ranges(old_consumed, consumed, None);
+            let before = Blockstore::get_completed_data_ranges(0, &completed, old_consumed);
+            let after = Blockstore::get_completed_data_ranges(0, &completed, consumed);
+            assert_eq!(after[before.len()..], fast[..]);
+            assert_eq!(end, after.last().map_or(0, |range| range.end));
+        }
+    }
+}
+
+#[test]
 fn test_get_completed_data_ranges() {
     let completed_data_end_indexes = [2, 4, 9, 11].iter().copied().collect();
 

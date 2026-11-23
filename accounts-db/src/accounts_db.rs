@@ -541,6 +541,41 @@ pub enum LoadHint {
     Unspecified,
 }
 
+static QN_LOAD_TRACKING: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    static QN_LOADS: std::cell::Cell<[u32; 3]> = const { std::cell::Cell::new([0; 3]) };
+    static QN_GEYSER_NOTIFY_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+pub fn qn_set_load_tracking(on: bool) {
+    QN_LOAD_TRACKING.store(on, Ordering::Relaxed);
+}
+
+pub fn qn_load_tracking() -> bool {
+    QN_LOAD_TRACKING.load(Ordering::Relaxed)
+}
+
+fn qn_note_load(source: usize) {
+    if qn_load_tracking() {
+        let mut loads = QN_LOADS.get();
+        loads[source] = loads[source].saturating_add(1);
+        QN_LOADS.set(loads);
+    }
+}
+
+pub fn qn_take_loads() -> [u32; 3] {
+    QN_LOADS.replace([0; 3])
+}
+
+pub fn qn_add_geyser_notify_ns(elapsed: u64) {
+    QN_GEYSER_NOTIFY_NS.set(QN_GEYSER_NOTIFY_NS.get().saturating_add(elapsed));
+}
+
+pub fn qn_take_geyser_notify_ns() -> u64 {
+    QN_GEYSER_NOTIFY_NS.replace(0)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum PopulateReadCache {
     /// If the account is found in storage, populate the read cache with the loaded account
@@ -3020,6 +3055,7 @@ impl AccountsDb {
             self.load_account_stats
                 .num_loaded_from_write_cache
                 .fetch_add(1, Ordering::Relaxed);
+            qn_note_load(0);
 
             let account = &cached_account.account;
             let should_load_account = load_filter.as_ref().is_none_or(|load_filter| {
@@ -3038,6 +3074,7 @@ impl AccountsDb {
             self.load_account_stats
                 .num_loaded_from_read_cache
                 .fetch_add(1, Ordering::Relaxed);
+            qn_note_load(1);
 
             let should_load_account = load_filter.as_ref().is_none_or(|load_filter| {
                 load_filter(account.lamports(), account.owner(), account.data().len())
@@ -3056,6 +3093,7 @@ impl AccountsDb {
         self.load_account_stats
             .num_loaded_from_index_storage
             .fetch_add(1, Ordering::Relaxed);
+        qn_note_load(2);
 
         let maybe_account =
             account_accessor.check_and_get_loaded_account_shared_data(load_filter.as_ref());

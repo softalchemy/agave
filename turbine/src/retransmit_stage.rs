@@ -417,6 +417,28 @@ fn retransmit(context: &RetransmitContext, state: &mut RetransmitState) -> Resul
                 stats.unknown_shred_slot_leader += num_shreds;
                 return None;
             };
+            if slot > root_bank.slot()
+                && !stats.slot_stats.contains(&slot)
+                && QN_EARLY_NOTIFIED.with(|n| {
+                    let mut n = n.borrow_mut();
+                    if n.contains(&slot) {
+                        false
+                    } else {
+                        if n.len() >= 64 {
+                            n.pop_front();
+                        }
+                        n.push_back(slot);
+                        true
+                    }
+                })
+            {
+                notify_subscribers(
+                    slot,
+                    timestamp(),
+                    &context.notifiers,
+                    pending_first_shred_event,
+                );
+            }
             let cluster_nodes =
                 cluster_nodes_cache.get(slot, &root_bank, &working_bank, cluster_info);
             Some((slot, (slot_leader.id, cluster_nodes)))
@@ -810,7 +832,7 @@ impl RetransmitStats {
             addr_cache.record(slot, &mut slot_stats);
             match self.slot_stats.get_mut(&slot) {
                 None => {
-                    if slot > root {
+                    if slot > root && !QN_EARLY_NOTIFIED.with(|n| n.borrow().contains(&slot)) {
                         notify_subscribers(
                             slot,
                             slot_stats.outset,
@@ -1144,4 +1166,10 @@ mod tests {
             Err(TryRecvError::Empty)
         ));
     }
+}
+
+thread_local! {
+    // slots whose FirstShredReceived already went out before the batch was retransmitted
+    static QN_EARLY_NOTIFIED: std::cell::RefCell<std::collections::VecDeque<Slot>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
 }

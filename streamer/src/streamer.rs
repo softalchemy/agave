@@ -174,6 +174,9 @@ fn recv_loop<P: SocketProvider>(
     // Receive buffers outlive the batches they are handed to, so that a call that reads
     // fewer packets than it provisioned for does not throw the spare buffers away.
     let mut pool = PacketBufferPool::new();
+    let recv_hook = packet::PACKET_RECV_HOOK_FACTORY
+        .get()
+        .and_then(|factory| factory(std::thread::current().name().unwrap_or_default()));
 
     loop {
         let mut packet_batch = BytesPacketBatch::with_capacity(PACKETS_PER_BATCH);
@@ -186,10 +189,22 @@ fn recv_loop<P: SocketProvider>(
             }
 
             #[cfg(unix)]
-            let result =
-                packet::recv_from(&mut packet_batch, socket, coalesce, &mut poll_fd, &mut pool);
+            let result = packet::recv_from(
+                &mut packet_batch,
+                socket,
+                coalesce,
+                &mut poll_fd,
+                &mut pool,
+                recv_hook.as_deref(),
+            );
             #[cfg(not(unix))]
-            let result = packet::recv_from(&mut packet_batch, socket, coalesce, &mut pool);
+            let result = packet::recv_from(
+                &mut packet_batch,
+                socket,
+                coalesce,
+                &mut pool,
+                recv_hook.as_deref(),
+            );
 
             if let Ok(len) = result {
                 if len > 0 {

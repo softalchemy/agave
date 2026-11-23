@@ -13,6 +13,10 @@ use {
         storable_accounts::StorableAccounts,
     },
     log::*,
+    rayon::{
+        ThreadPool,
+        iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator},
+    },
     solana_account::{AccountSharedData, ReadableAccount},
     solana_address_lookup_table_interface::{
         self as address_lookup_table, error::AddressLookupError, state::AddressLookupTable,
@@ -20,10 +24,9 @@ use {
     solana_clock::{BankId, Slot},
     solana_message::v0::LoadedAddresses,
     solana_pubkey::Pubkey,
+    solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
     solana_slot_hashes::SlotHashes,
-    solana_svm_transaction::{
-        message_address_table_lookup::SVMMessageAddressTableLookup, svm_message::SVMMessage,
-    },
+    solana_svm_transaction::message_address_table_lookup::SVMMessageAddressTableLookup,
     solana_transaction::sanitized::SanitizedTransaction,
     solana_transaction_context::transaction_accounts::KeyedAccountSharedData,
     solana_transaction_error::TransactionResult as Result,
@@ -32,18 +35,21 @@ use {
         collections::{BinaryHeap, HashMap, HashSet},
         sync::{
             Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicU64, AtomicUsize, Ordering},
         },
     },
 };
 
+pub const LARGE_STORE_NUM_ACCOUNTS: usize = 64;
+pub static LARGE_STORE_GEYSER_NOTIFY_NS: AtomicU64 = AtomicU64::new(0);
+
 pub type PubkeyAccountSlot = (Pubkey, AccountSharedData, Slot);
 
-struct TransactionAccountLocksIterator<'a, T: SVMMessage> {
+struct TransactionAccountLocksIterator<'a, T: TransactionWithMeta> {
     transaction: &'a T,
 }
 
-impl<'a, T: SVMMessage> TransactionAccountLocksIterator<'a, T> {
+impl<'a, T: TransactionWithMeta> TransactionAccountLocksIterator<'a, T> {
     pub(crate) fn new(transaction: &'a T) -> Self {
         Self { transaction }
     }
@@ -56,6 +62,12 @@ impl<'a, T: SVMMessage> TransactionAccountLocksIterator<'a, T> {
             .iter()
             .enumerate()
             .map(|(index, key)| (key, self.transaction.is_writable(index)))
+            .chain(
+                self.transaction
+                    .implicit_read_locks()
+                    .iter()
+                    .map(|key| (key, false)),
+            )
     }
 }
 
@@ -462,7 +474,7 @@ impl Accounts {
     #[must_use]
     pub fn lock_accounts<'a>(
         &self,
-        txs: impl Iterator<Item = &'a (impl SVMMessage + 'a)>,
+        txs: impl Iterator<Item = &'a (impl TransactionWithMeta + 'a)>,
         results: impl Iterator<Item = Result<()>>,
         tx_account_lock_limit: usize,
     ) -> Vec<Result<()>> {
@@ -482,7 +494,7 @@ impl Accounts {
     }
 
     /// Once accounts are unlocked, new transactions that modify that state can enter the pipeline
-    pub fn unlock_accounts<'a, Tx: SVMMessage + 'a>(
+    pub fn unlock_accounts<'a, Tx: TransactionWithMeta + 'a>(
         &self,
         txs_and_results: impl Iterator<Item = (&'a Tx, &'a Result<()>)> + Clone,
     ) {
@@ -510,6 +522,10 @@ impl Accounts {
     ) {
         let accounts_db = &self.accounts_db;
         if accounts_db.has_accounts_update_notifier() {
+            let notify_start =
+                (accounts.len() >= LARGE_STORE_NUM_ACCOUNTS).then(std::time::Instant::now);
+            let tracked_start =
+                crate::accounts_db::qn_load_tracking().then(std::time::Instant::now);
             let mut current_write_version = accounts_db
                 .write_version
                 .fetch_add(accounts.len() as u64, Ordering::AcqRel);
@@ -529,9 +545,57 @@ impl Accounts {
                 });
                 current_write_version = current_write_version.saturating_add(1);
             }
+            if let Some(notify_start) = notify_start {
+                LARGE_STORE_GEYSER_NOTIFY_NS
+                    .store(notify_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            if let Some(tracked_start) = tracked_start {
+                crate::accounts_db::qn_add_geyser_notify_ns(
+                    tracked_start.elapsed().as_nanos() as u64
+                );
+            }
         }
 
         accounts_db.store_accounts_unfrozen(accounts, ancestors);
+    }
+
+    pub fn store_accounts_with_parallel_notify(
+        &self,
+        slot: Slot,
+        accounts: &[(Pubkey, AccountSharedData)],
+        bank_id: BankId,
+        ancestors: &Ancestors,
+        thread_pool: &ThreadPool,
+    ) {
+        let accounts_db = &self.accounts_db;
+        if !accounts_db.has_accounts_update_notifier() {
+            accounts_db.store_accounts_unfrozen((slot, accounts), ancestors);
+            return;
+        }
+        let first_write_version = accounts_db
+            .write_version
+            .fetch_add(accounts.len() as u64, Ordering::AcqRel);
+        thread_pool.in_place_scope(|scope| {
+            scope.spawn(|_| {
+                let notify_start = std::time::Instant::now();
+                accounts
+                    .par_iter()
+                    .enumerate()
+                    .for_each(|(index, (pubkey, account))| {
+                        accounts_db.notify_account_at_accounts_update(
+                            slot,
+                            bank_id,
+                            account,
+                            &None,
+                            pubkey,
+                            first_write_version.saturating_add(index as u64),
+                        );
+                    });
+                LARGE_STORE_GEYSER_NOTIFY_NS
+                    .store(notify_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            });
+            accounts_db.store_accounts_unfrozen((slot, accounts), ancestors);
+        });
     }
 
     /// Add a slot to root.  Root slots cannot be purged
@@ -544,18 +608,17 @@ impl Accounts {
 mod tests {
     use {
         super::*,
-        agave_reserved_account_keys::ReservedAccountKeys,
         solana_account::{AccountSharedData, WritableAccount},
         solana_address_lookup_table_interface::state::LookupTableMeta,
         solana_hash::Hash,
         solana_instruction::{AccountMeta, Instruction},
         solana_keypair::Keypair,
         solana_message::{
-            LegacyMessage, Message, MessageHeader, SanitizedMessage,
-            compiled_instruction::CompiledInstruction, v0::MessageAddressTableLookup,
+            Message, MessageHeader, compiled_instruction::CompiledInstruction,
+            v0::MessageAddressTableLookup,
         },
+        solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
         solana_sdk_ids::native_loader,
-        solana_signature::Signature,
         solana_signer::{Signer, signers::Signers},
         solana_transaction::{Transaction, sanitized::MAX_TX_ACCOUNT_LOCKS},
         solana_transaction_error::TransactionError,
@@ -571,29 +634,25 @@ mod tests {
         from_keypairs: &T,
         message: Message,
         recent_blockhash: Hash,
-    ) -> SanitizedTransaction {
-        SanitizedTransaction::from_transaction_for_tests(Transaction::new(
+    ) -> RuntimeTransaction<SanitizedTransaction> {
+        RuntimeTransaction::from_transaction_for_tests(Transaction::new(
             from_keypairs,
             message,
             recent_blockhash,
         ))
     }
 
-    fn sanitized_tx_from_metas(accounts: Vec<AccountMeta>) -> SanitizedTransaction {
+    fn sanitized_tx_from_metas(
+        accounts: Vec<AccountMeta>,
+    ) -> RuntimeTransaction<SanitizedTransaction> {
         let instruction = Instruction {
             accounts,
             program_id: Pubkey::default(),
             data: vec![],
         };
 
-        let message = Message::new(&[instruction], None);
-
-        let sanitized_message = SanitizedMessage::Legacy(LegacyMessage::new(
-            message,
-            &ReservedAccountKeys::empty_key_set(),
-        ));
-
-        SanitizedTransaction::new_for_tests(sanitized_message, vec![Signature::new_unique()], false)
+        let message = Message::new(&[instruction], Some(&Pubkey::new_unique()));
+        RuntimeTransaction::from_transaction_for_tests(Transaction::new_unsigned(message))
     }
 
     #[test]

@@ -8,9 +8,13 @@ use {
         filter::{ShredFilterContext, TurbineMode},
     },
     solana_perf::packet::{PacketBatch, PacketFlags, PacketRef},
-    solana_runtime::bank_forks::{BankForks, SharableBanks},
+    solana_runtime::{
+        bank_forks::{BankForks, SharableBanks},
+        qn_flags, shred_to_tx_timing,
+    },
     solana_streamer::{
         evicting_sender::EvictingSender,
+        packet::{PACKET_RECV_HOOK_FACTORY, PacketRecvHook},
         streamer::{self, ChannelSend, PacketBatchReceiver, StreamerReceiveStats},
     },
     std::{
@@ -23,6 +27,29 @@ use {
 
 pub(crate) struct ShredFetchStage {
     thread_hdls: Vec<JoinHandle<()>>,
+}
+
+fn shred_recv_hook(thread_name: &str) -> Option<PacketRecvHook> {
+    let ingress = if thread_name.starts_with("solRcvrShredRep") {
+        shred_to_tx_timing::INGRESS_REPAIR
+    } else if thread_name.starts_with("solRcvrShred") {
+        shred_to_tx_timing::INGRESS_TURBINE
+    } else {
+        return None;
+    };
+    Some(Box::new(move |batch, first_new| {
+        let now = shred_to_tx_timing::now();
+        for packet in batch.iter().skip(first_new) {
+            if let Some(data) = packet.data(..) {
+                solana_ledger::shred_to_tx_timing::packet_received(
+                    data,
+                    packet.meta().addr,
+                    ingress,
+                    now,
+                );
+            }
+        }
+    }))
 }
 
 /// Ingress limit for the shred fetch channel (in terms of packet _batches_).
@@ -114,6 +141,14 @@ impl ShredFetchStage {
                     packet.meta_mut().flags.insert(flags);
                 }
             }
+            if qn_flags::shred_to_tx_timing() {
+                let now = shred_to_tx_timing::now();
+                for packet in packet_batch.iter().filter(|p| !p.meta().discard()) {
+                    if let Some(data) = packet.data(..) {
+                        solana_ledger::shred_to_tx_timing::packet_modified(data, now);
+                    }
+                }
+            }
             if shred_filter_ctx.maybe_submit_stats(name, STATS_SUBMIT_CADENCE)
                 && let Some(stats) = recvr_stats.as_ref()
             {
@@ -150,6 +185,10 @@ impl ShredFetchStage {
             ShredIngress::Repair(_) => REPAIR_FETCH_CHANNEL_SIZE,
         };
         let (packet_sender, packet_receiver) = EvictingSender::new_bounded(channel_size);
+        let coalesce_ms = std::env::var("AGAVE_SHRED_FETCH_COALESCE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
         let receiver_stats = Arc::new(StreamerReceiveStats::new(receiver_name));
         let streamers = sockets
             .into_iter()
@@ -161,7 +200,7 @@ impl ShredFetchStage {
                     exit.clone(),
                     packet_sender.clone(),
                     receiver_stats.clone(),
-                    Some(Duration::from_millis(5)), // coalesce
+                    Some(Duration::from_millis(coalesce_ms)), // coalesce
                     false,                          // is_staked_service
                 )
             })
@@ -196,6 +235,9 @@ impl ShredFetchStage {
         turbine_mode: TurbineMode,
         exit: Arc<AtomicBool>,
     ) -> Self {
+        if qn_flags::shred_to_tx_timing() {
+            let _ = PACKET_RECV_HOOK_FACTORY.set(shred_recv_hook);
+        }
         let repair_context = RepairContext {
             repair_socket: repair_socket.clone(),
             cluster_info,

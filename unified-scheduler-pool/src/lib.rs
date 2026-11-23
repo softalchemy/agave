@@ -29,15 +29,20 @@ use {
     solana_clock::Slot,
     solana_pubkey::Pubkey,
     solana_runtime::{
+        bank::speculation::{self as bank_speculation, Speculation, SpeculationInputs},
         installed_scheduler_pool::{
             InstalledScheduler, InstalledSchedulerBox, InstalledSchedulerPool, ResultWithTimings,
             ScheduleResult, SchedulerAborted, SchedulerId, SchedulingContext, TimeoutListener,
             UninstalledScheduler, UninstalledSchedulerBox, initialized_result_with_timings,
         },
         prioritization_fee_cache::PrioritizationFeeCache,
+        qn_flags,
         transaction_execution::{
-            TransactionBatchWithIndexes, TransactionStatusSender, execute_batch,
+            BatchPostCommit, TransactionBatchWithIndexes, TransactionStatusSender, execute_batch,
+            execute_batch_until_commit_with_speculation, finish_batch_after_commit,
+            speculate_batch,
         },
+        tx_exec_timing::{self, SchedulerThreadTiming, Step},
         vote_sender_types::{ReplayVoteSendType, ReplayVoteSender},
     },
     solana_runtime_transaction::runtime_transaction::ReplayTransaction,
@@ -53,7 +58,10 @@ use {
         mem,
         sync::{
             Arc, Mutex, OnceLock, Weak,
-            atomic::{AtomicU64, Ordering::Relaxed},
+            atomic::{
+                AtomicBool, AtomicU8, AtomicU64, AtomicUsize,
+                Ordering::{AcqRel, Acquire, Relaxed, Release},
+            },
         },
         thread::{self, JoinHandle, sleep},
         time::{Duration, Instant},
@@ -643,6 +651,61 @@ pub trait TaskHandler: Send + Sync + Debug + Sized + 'static {
         task: &Task,
         handler_context: &HandlerContext,
     );
+
+    fn handle_until_commit(
+        result: &mut Result<()>,
+        timings: &mut ExecuteTimings,
+        scheduling_context: &SchedulingContext,
+        task: &Task,
+        handler_context: &HandlerContext,
+    ) -> Option<BatchPostCommit> {
+        Self::handle(result, timings, scheduling_context, task, handler_context);
+        None
+    }
+
+    fn handle_after_commit(
+        _scheduling_context: &SchedulingContext,
+        _task: &Task,
+        _handler_context: &HandlerContext,
+        _post_commit: BatchPostCommit,
+    ) {
+    }
+
+    fn can_speculate(_task: &Task) -> bool {
+        false
+    }
+
+    fn speculate(
+        _scheduling_context: &SchedulingContext,
+        _task: &Task,
+        _handler_context: &HandlerContext,
+        _inputs: &Arc<SpeculationInputs>,
+    ) -> Option<Speculation> {
+        None
+    }
+
+    fn handle_until_commit_with_speculation(
+        result: &mut Result<()>,
+        timings: &mut ExecuteTimings,
+        scheduling_context: &SchedulingContext,
+        task: &Task,
+        handler_context: &HandlerContext,
+        _speculation: Option<Speculation>,
+    ) -> Option<BatchPostCommit> {
+        Self::handle_until_commit(result, timings, scheduling_context, task, handler_context)
+    }
+}
+
+const SPECULATION_PENDING: u8 = 0;
+const SPECULATION_RUNNING: u8 = 1;
+const SPECULATION_DONE: u8 = 2;
+const SPECULATION_TAKEN: u8 = 3;
+
+#[derive(Default)]
+struct SpeculationCell {
+    state: AtomicU8,
+    inputs: Arc<SpeculationInputs>,
+    result: Mutex<Option<Speculation>>,
 }
 
 #[derive(Debug)]
@@ -682,6 +745,105 @@ impl TaskHandler for DefaultTaskHandler {
             handler_context.prioritization_fee_cache.as_deref(),
         );
         sleepless_testing::at(CheckPoint::TaskHandled(task_id));
+    }
+
+    fn handle_until_commit(
+        result: &mut Result<()>,
+        timings: &mut ExecuteTimings,
+        scheduling_context: &SchedulingContext,
+        task: &Task,
+        handler_context: &HandlerContext,
+    ) -> Option<BatchPostCommit> {
+        Self::handle_until_commit_with_speculation(
+            result,
+            timings,
+            scheduling_context,
+            task,
+            handler_context,
+            None,
+        )
+    }
+
+    fn can_speculate(task: &Task) -> bool {
+        solana_runtime::bank::Bank::speculation_eligible(task.transaction())
+    }
+
+    fn speculate(
+        scheduling_context: &SchedulingContext,
+        task: &Task,
+        handler_context: &HandlerContext,
+        inputs: &Arc<SpeculationInputs>,
+    ) -> Option<Speculation> {
+        let bank = scheduling_context.bank();
+        let batch = bank.prepare_unlocked_batch_from_single_tx(task.transaction());
+        speculate_batch(
+            &batch,
+            handler_context.transaction_status_sender.is_some(),
+            handler_context.log_messages_bytes_limit,
+            inputs,
+        )
+    }
+
+    fn handle_until_commit_with_speculation(
+        result: &mut Result<()>,
+        timings: &mut ExecuteTimings,
+        scheduling_context: &SchedulingContext,
+        task: &Task,
+        handler_context: &HandlerContext,
+        speculation: Option<Speculation>,
+    ) -> Option<BatchPostCommit> {
+        let bank = scheduling_context.bank();
+        let transaction = task.transaction();
+        let task_id = task.task_id();
+
+        let batch = bank.prepare_unlocked_batch_from_single_tx(transaction);
+
+        let transaction_indexes = vec![task_id.try_into().unwrap()];
+        let batch_with_indexes = TransactionBatchWithIndexes {
+            batch,
+            transaction_indexes,
+        };
+
+        let executed = execute_batch_until_commit_with_speculation(
+            &batch_with_indexes,
+            bank,
+            handler_context.transaction_status_sender.as_ref(),
+            handler_context.replay_vote_sender.as_ref(),
+            ReplayVoteSendType::Executed {
+                replay_bank_id: bank.bank_id(),
+                replay_slot: bank.slot(),
+            },
+            timings,
+            handler_context.log_messages_bytes_limit,
+            speculation,
+        );
+        let post_commit = match executed {
+            Ok(post_commit) => {
+                *result = Ok(());
+                Some(post_commit)
+            }
+            Err(error) => {
+                *result = Err(error);
+                None
+            }
+        };
+        sleepless_testing::at(CheckPoint::TaskHandled(task_id));
+        post_commit
+    }
+
+    fn handle_after_commit(
+        scheduling_context: &SchedulingContext,
+        task: &Task,
+        handler_context: &HandlerContext,
+        post_commit: BatchPostCommit,
+    ) {
+        finish_batch_after_commit(
+            std::slice::from_ref(task.transaction()),
+            scheduling_context.bank(),
+            handler_context.transaction_status_sender.as_ref(),
+            handler_context.prioritization_fee_cache.as_deref(),
+            post_commit,
+        );
     }
 }
 
@@ -1128,6 +1290,71 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
         );
     }
 
+    fn run_speculation(
+        scheduling_context: &SchedulingContext,
+        task: &Task,
+        cell: &SpeculationCell,
+        handler_context: &HandlerContext,
+        panic_sender: &Sender<HandlerResult>,
+    ) {
+        if cell
+            .state
+            .compare_exchange(SPECULATION_PENDING, SPECULATION_RUNNING, AcqRel, Acquire)
+            .is_err()
+        {
+            return;
+        }
+        defer! {
+            cell.state.store(SPECULATION_DONE, Release);
+            if thread::panicking() {
+                let _ = panic_sender.send(Err(HandlerPanicked));
+            }
+        }
+        let speculation = TH::speculate(scheduling_context, task, handler_context, &cell.inputs);
+        *cell.result.lock().unwrap() = speculation;
+    }
+
+    fn take_speculation(
+        scheduling_context: &SchedulingContext,
+        cells: &DashMap<OrderedTaskId, Arc<SpeculationCell>>,
+        task: &Task,
+    ) -> Option<Speculation> {
+        let (_, cell) = cells.remove(&task.task_id())?;
+        let mut waiting_since = None;
+        loop {
+            match cell.state.compare_exchange(
+                SPECULATION_PENDING,
+                SPECULATION_TAKEN,
+                AcqRel,
+                Acquire,
+            ) {
+                Ok(_) => return None,
+                Err(SPECULATION_RUNNING) => {
+                    if waiting_since.is_none() {
+                        if !scheduling_context
+                            .bank()
+                            .speculation_inputs_unchanged(&cell.inputs)
+                        {
+                            bank_speculation::abandoned(scheduling_context.slot());
+                            return None;
+                        }
+                        waiting_since = Some(Instant::now());
+                    }
+                    std::hint::spin_loop();
+                }
+                Err(_) => {
+                    if let Some(waiting_since) = waiting_since {
+                        bank_speculation::waited(
+                            scheduling_context.slot(),
+                            waiting_since.elapsed().as_nanos() as u64,
+                        );
+                    }
+                    return cell.result.lock().unwrap().take();
+                }
+            }
+        }
+    }
+
     fn max_running_task_count() -> Option<usize> {
         // Unlike block production, there is no agony for block verification with regards
         // to max_running_task_count. Its responsibility is to execute all transactions by
@@ -1316,8 +1543,22 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
         // 4. the handler thread processes the dispatched task.
         // 5. the handler thread reply back to the scheduler thread as an executed task.
         // 6. the scheduler thread post-processes the executed task.
+        let spin = qn_flags::sched_spin();
+        let finish_before_notify = qn_flags::sched_finish_before_notify();
+        let post_commit_pending = Arc::new(AtomicUsize::new(0));
+        let session_active = Arc::new(AtomicBool::new(true));
+        let speculation_reserve = qn_flags::sched_optimistic_reserve();
+        let optimistic =
+            qn_flags::sched_optimistic() && handler_context.thread_count > speculation_reserve;
+        let speculation_cells = Arc::new(DashMap::<OrderedTaskId, Arc<SpeculationCell>>::new());
+        let (speculation_sender, speculation_receiver) =
+            crossbeam_channel::unbounded::<(Task, Arc<SpeculationCell>)>();
+
         let scheduler_main_loop = {
             let handler_context = handler_context.clone_for_scheduler_thread();
+            let post_commit_pending = post_commit_pending.clone();
+            let session_active = session_active.clone();
+            let speculation_cells = speculation_cells.clone();
             let session_result_sender = self.session_result_sender.clone();
             // Taking new_task_receiver here is important to ensure there's a single receiver. In
             // this way, the replay stage will get .send() failures reliably, after this scheduler
@@ -1377,6 +1618,7 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                         Self::max_unique_active_task_count(),
                     )
                 };
+                let mut timing = SchedulerThreadTiming::new();
 
                 // The following loop maintains and updates ResultWithTimings as its
                 // externally-provided mutable state for each session in this way:
@@ -1392,6 +1634,18 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                         // makes no perf. difference...
                         let dummy_unblocked_task_receiver =
                             dummy_receiver(Self::can_receive_unblocked_task(&state_machine));
+                        if let Some(spin) = spin
+                            && !Self::can_receive_unblocked_task(&state_machine)
+                        {
+                            let deadline = Instant::now() + spin;
+                            while finished_blocked_task_receiver.is_empty()
+                                && new_task_receiver.is_empty()
+                                && finished_idle_task_receiver.is_empty()
+                                && Instant::now() < deadline
+                            {
+                                std::hint::spin_loop();
+                            }
+                        }
 
                         // There's something special called dummy_unblocked_task_receiver here.
                         // This odd pattern was needed to react to newly unblocked tasks from
@@ -1409,7 +1663,17 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                                 let Ok(executed_task) = handler_result else {
                                     break 'nonaborted_main_loop;
                                 };
+                                let unblocked_before = state_machine.unblocked_task_queue_count();
                                 state_machine.deschedule_task(&executed_task.task);
+                                if timing.on {
+                                    timing.descheduled(
+                                        current_slot,
+                                        executed_task.task.task_id() as usize,
+                                        state_machine
+                                            .unblocked_task_queue_count()
+                                            .saturating_sub(unblocked_before),
+                                    );
+                                }
 
                                 if Self::abort_or_accumulate_result_with_timings(
                                     &mut result_with_timings,
@@ -1424,6 +1688,9 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                                 let task = state_machine
                                     .schedule_next_unblocked_task()
                                     .expect("unblocked task");
+                                if timing.on {
+                                    timing.dispatched(current_slot, task.task_id() as usize);
+                                }
                                 runnable_task_sender.send_payload(task).unwrap();
                             },
                             recv(new_task_receiver) -> message => {
@@ -1433,11 +1700,25 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                                     Ok(NewTaskPayload::Payload(task)) => {
                                         let task_id = task.task_id();
                                         sleepless_testing::at(CheckPoint::NewTask(task_id));
+                                        let speculative_task = (optimistic
+                                            && TH::can_speculate(&task))
+                                        .then(|| task.clone());
 
                                         if let Some(task) = state_machine.schedule_or_buffer_task(task, session_ending) {
+                                            if timing.on {
+                                                timing.received(current_slot, task_id as usize, false);
+                                            }
                                             runnable_task_sender.send_aux_payload(task).unwrap();
                                         } else {
+                                            if timing.on {
+                                                timing.received(current_slot, task_id as usize, true);
+                                            }
                                             sleepless_testing::at(CheckPoint::BufferedOrDroppedTask(task_id));
+                                            if let Some(task) = speculative_task {
+                                                let cell = Arc::new(SpeculationCell::default());
+                                                speculation_cells.insert(task_id, cell.clone());
+                                                let _ = speculation_sender.send((task, cell));
+                                            }
                                         }
                                     }
                                     Ok(NewTaskPayload::CloseSubchannel) => {
@@ -1463,7 +1744,17 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                                 let Ok(executed_task) = handler_result else {
                                     break 'nonaborted_main_loop;
                                 };
+                                let unblocked_before = state_machine.unblocked_task_queue_count();
                                 state_machine.deschedule_task(&executed_task.task);
+                                if timing.on {
+                                    timing.descheduled(
+                                        current_slot,
+                                        executed_task.task.task_id() as usize,
+                                        state_machine
+                                            .unblocked_task_queue_count()
+                                            .saturating_sub(unblocked_before),
+                                    );
+                                }
 
                                 if Self::abort_or_accumulate_result_with_timings(
                                     &mut result_with_timings,
@@ -1478,14 +1769,29 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                     }
                     assert!(mem::replace(&mut is_finished, false));
 
+                    while post_commit_pending.load(Relaxed) != 0 {
+                        if finished_blocked_task_receiver.try_recv().is_ok()
+                            || finished_idle_task_receiver.try_recv().is_ok()
+                        {
+                            break 'nonaborted_main_loop;
+                        }
+                        std::hint::spin_loop();
+                    }
+
                     sleepless_testing::at(CheckPoint::SessionFinished(current_slot));
                     // Finalize the current session after asserting it's explicitly requested so.
                     // Send result first because this is blocking the replay code-path.
                     session_result_sender
                         .send(result_with_timings)
                         .expect("always outlived receiver");
+                    session_active.store(false, Relaxed);
+                    if optimistic {
+                        speculation_cells.clear();
+                        bank_speculation::report(current_slot);
+                    }
 
                     state_machine.reinitialize();
+                    timing.reset();
                     assert!(mem::replace(&mut session_ending, false));
 
                     // This variable is hoisted from OpenSubchannel match arm to pass the rustc
@@ -1525,6 +1831,7 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                                 // enter into the preceding `while(!is_finished) {...}` loop again.
                                 // Before that, propagate new SchedulingContext to handler threads
                                 current_slot = new_context.slot();
+                                session_active.store(true, Relaxed);
                                 runnable_task_sender
                                     .send_chained_channel(
                                         &new_context,
@@ -1583,6 +1890,16 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
             let mut runnable_task_receiver = runnable_task_receiver.clone();
             let finished_blocked_task_sender = finished_blocked_task_sender.clone();
             let finished_idle_task_sender = finished_idle_task_sender.clone();
+            let handler_timing = tx_exec_timing::enabled();
+            let post_commit_pending = post_commit_pending.clone();
+            let session_active = session_active.clone();
+            let speculation_cells = speculation_cells.clone();
+            let mut speculation_receiver = if optimistic && thread_index >= speculation_reserve {
+                speculation_receiver.clone()
+            } else {
+                never()
+            };
+            let mut speculation_disconnected = false;
 
             // The following loop maintains and updates SchedulingContext as its
             // externally-provided state for each session in this way:
@@ -1619,6 +1936,21 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                 };
 
                 loop {
+                    if speculation_disconnected {
+                        speculation_receiver = never();
+                        speculation_disconnected = false;
+                    }
+                    if let Some(spin) = spin {
+                        let deadline = Instant::now() + spin;
+                        while runnable_task_receiver.for_select().is_empty()
+                            && runnable_task_receiver.aux_for_select().is_empty()
+                            && speculation_receiver.is_empty()
+                            && session_active.load(Relaxed)
+                            && Instant::now() < deadline
+                        {
+                            std::hint::spin_loop();
+                        }
+                    }
                     let (task, sender) = select_biased! {
                         recv(runnable_task_receiver.for_select()) -> message => {
                             let Ok(message) = message else {
@@ -1637,8 +1969,30 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                                 runnable_task_receiver.never_receive_from_aux();
                                 continue;
                             }
+                        },
+                        recv(speculation_receiver) -> message => {
+                            match message {
+                                Ok((task, cell)) => Self::run_speculation(
+                                    runnable_task_receiver.context(),
+                                    &task,
+                                    &cell,
+                                    &handler_context,
+                                    &finished_idle_task_sender,
+                                ),
+                                Err(_) => speculation_disconnected = true,
+                            }
+                            continue;
                         }
                     };
+                    let timed_task = handler_timing.then(|| {
+                        (
+                            runnable_task_receiver.context().slot(),
+                            task.task_id() as usize,
+                        )
+                    });
+                    if let Some((slot, index)) = timed_task {
+                        tx_exec_timing::picked_up(slot, index, thread_index);
+                    }
                     defer! {
                         if !thread::panicking() {
                             return;
@@ -1657,14 +2011,68 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                         }
                     }
                     let mut task = ExecutedTask::new_boxed(task);
-                    Self::execute_task_with_handler(
-                        runnable_task_receiver.context(),
-                        &mut task,
-                        &handler_context,
-                    );
+                    let speculation = if optimistic {
+                        Self::take_speculation(
+                            runnable_task_receiver.context(),
+                            &speculation_cells,
+                            &task.task,
+                        )
+                    } else {
+                        None
+                    };
+                    let post_commit = if finish_before_notify {
+                        TH::handle_until_commit_with_speculation(
+                            &mut task.result_with_timings.0,
+                            &mut task.result_with_timings.1,
+                            runnable_task_receiver.context(),
+                            &task.task,
+                            &handler_context,
+                            speculation,
+                        )
+                    } else if speculation.is_some() {
+                        if let Some(post_commit) = TH::handle_until_commit_with_speculation(
+                            &mut task.result_with_timings.0,
+                            &mut task.result_with_timings.1,
+                            runnable_task_receiver.context(),
+                            &task.task,
+                            &handler_context,
+                            speculation,
+                        ) {
+                            TH::handle_after_commit(
+                                runnable_task_receiver.context(),
+                                &task.task,
+                                &handler_context,
+                                post_commit,
+                            );
+                        }
+                        None
+                    } else {
+                        Self::execute_task_with_handler(
+                            runnable_task_receiver.context(),
+                            &mut task,
+                            &handler_context,
+                        );
+                        None
+                    };
+                    let post_commit = post_commit.map(|post_commit| {
+                        post_commit_pending.fetch_add(1, Relaxed);
+                        (task.task.clone(), post_commit)
+                    });
+                    if let Some((slot, index)) = timed_task {
+                        tx_exec_timing::handler_done(slot, index);
+                    }
                     if sender.send(Ok(task)).is_err() {
                         warn!("handler_thread: scheduler thread aborted...");
                         break;
+                    }
+                    if let Some((task, post_commit)) = post_commit {
+                        TH::handle_after_commit(
+                            runnable_task_receiver.context(),
+                            &task,
+                            &handler_context,
+                            post_commit,
+                        );
+                        post_commit_pending.fetch_sub(1, Relaxed);
                     }
                 }
             }
@@ -1938,10 +2346,15 @@ impl<TH: TaskHandler> InstalledScheduler for PooledScheduler<TH> {
         transaction: ReplayTransaction,
         task_id: OrderedTaskId,
     ) -> ScheduleResult {
+        let timing_start = tx_exec_timing::split_start();
         let task = SchedulingStateMachine::create_task(transaction, task_id, &mut |pubkey| {
             self.inner.usage_queue_loader.load(pubkey)
         });
-        self.inner.thread_manager.send_task(task)
+        let timing_created = tx_exec_timing::split_add(Step::CreateTask, timing_start);
+        tx_exec_timing::scheduled(self.context.slot(), task_id as usize);
+        let result = self.inner.thread_manager.send_task(task);
+        tx_exec_timing::split_add(Step::Send, timing_created);
+        result
     }
 
     fn recover_error_after_abort(&mut self) -> TransactionError {
@@ -2729,6 +3142,183 @@ mod tests {
             bank.wait_for_completed_scheduler(),
             Some((Err(TransactionError::CommitCancelled), _))
         );
+    }
+
+    #[test]
+    fn test_scheduler_optimistic_matches_serial() {
+        agave_logger::setup();
+
+        const SHARED: usize = 8;
+        const PAYERS: usize = 720;
+        let GenesisConfigInfo {
+            genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config(1_000_000_000_000_000);
+        let (bank, _bank_forks) = setup_dummy_fork_graph(Bank::new_for_tests(&genesis_config));
+        let (reference, _reference_forks) =
+            setup_dummy_fork_graph(Bank::new_for_tests(&genesis_config));
+        let blockhash = genesis_config.hash();
+        let shared = (0..SHARED)
+            .map(|_| solana_pubkey::new_rand())
+            .collect::<Vec<_>>();
+        let payers = (0..PAYERS).map(|_| Keypair::new()).collect::<Vec<_>>();
+        let payer_keys = payers
+            .iter()
+            .map(|payer| Pubkey::try_from(&payer.to_bytes()[32..]).unwrap())
+            .collect::<Vec<_>>();
+        for (index, account) in payer_keys.iter().chain(shared.iter()).enumerate() {
+            let funding = system_transaction::transfer(
+                &mint_keypair,
+                account,
+                10_000_000_000 + index as u64,
+                blockhash,
+            );
+            bank.process_transaction(&funding).unwrap();
+            reference.process_transaction(&funding).unwrap();
+        }
+        let transactions = payers
+            .iter()
+            .enumerate()
+            .map(|(index, payer)| {
+                let lamports = match index % 6 {
+                    0..=2 => 100_000_000_000 + index as u64,
+                    3 | 4 => 0,
+                    _ => 1 + index as u64,
+                };
+                system_transaction::transfer(payer, &shared[index % SHARED], lamports, blockhash)
+            })
+            .collect::<Vec<_>>();
+        let valid_before = bank_speculation::counters_snapshot()[2].1;
+        let pool = DefaultSchedulerPool::new_for_verification(Some(8), None, None, None, None);
+        let scheduler = pool.do_take_scheduler(SchedulingContext::new(bank.clone()));
+        let bank = BankWithScheduler::new(bank, Some(Box::new(scheduler)));
+        bank.schedule_transaction_executions(
+            transactions
+                .iter()
+                .enumerate()
+                .map(|(task_id, transaction)| {
+                    (ReplayTransaction::from(transaction.clone()), task_id as u128)
+                })
+                .collect::<Vec<_>>()
+                .into_iter(),
+        )
+        .unwrap();
+        assert_matches!(bank.wait_for_completed_scheduler(), Some((Ok(()), _)));
+        let mut failed = 0;
+        for transaction in &transactions {
+            failed += reference.process_transaction(transaction).is_err() as usize;
+        }
+        assert_eq!(failed, PAYERS / 2);
+        assert_eq!(bank.transaction_count(), reference.transaction_count());
+        assert_eq!(
+            bank.transaction_error_count(),
+            reference.transaction_error_count()
+        );
+        for account in shared.iter().chain(payer_keys.iter()) {
+            assert_eq!(bank.get_account(account), reference.get_account(account));
+        }
+        bank.freeze();
+        reference.freeze();
+        assert_eq!(bank.hash(), reference.hash());
+        assert_eq!(bank_speculation::verify_mismatch_total(), 0);
+        let counters = bank_speculation::counters_snapshot();
+        info!("optimistic counters: {counters:?}");
+        if qn_flags::sched_optimistic() {
+            assert!(counters[2].1 > valid_before);
+        } else {
+            assert_eq!(counters[0].1, 0);
+        }
+    }
+
+    #[test]
+    fn test_scheduler_finish_before_post_commit() {
+        agave_logger::setup();
+
+        static SECOND_TASK_HANDLED: AtomicBool = AtomicBool::new(false);
+        static UNLOCKED_BEFORE_POST_COMMIT: AtomicBool = AtomicBool::new(false);
+        static POST_COMMIT_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Debug)]
+        struct PostCommitHandler;
+        impl TaskHandler for PostCommitHandler {
+            fn handle(
+                _result: &mut Result<()>,
+                _timings: &mut ExecuteTimings,
+                _scheduling_context: &SchedulingContext,
+                task: &Task,
+                _handler_context: &HandlerContext,
+            ) {
+                if task.task_id() == 1 {
+                    SECOND_TASK_HANDLED.store(true, Relaxed);
+                }
+            }
+
+            fn handle_until_commit(
+                result: &mut Result<()>,
+                timings: &mut ExecuteTimings,
+                scheduling_context: &SchedulingContext,
+                task: &Task,
+                handler_context: &HandlerContext,
+            ) -> Option<BatchPostCommit> {
+                Self::handle(result, timings, scheduling_context, task, handler_context);
+                Some(BatchPostCommit::default())
+            }
+
+            fn handle_after_commit(
+                _scheduling_context: &SchedulingContext,
+                task: &Task,
+                _handler_context: &HandlerContext,
+                _post_commit: BatchPostCommit,
+            ) {
+                if task.task_id() == 0 {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !SECOND_TASK_HANDLED.load(Relaxed) && Instant::now() < deadline {
+                        sleep(Duration::from_millis(1));
+                    }
+                    UNLOCKED_BEFORE_POST_COMMIT.store(SECOND_TASK_HANDLED.load(Relaxed), Relaxed);
+                }
+                sleep(Duration::from_millis(50));
+                POST_COMMIT_COUNT.fetch_add(1, Relaxed);
+            }
+        }
+
+        let GenesisConfigInfo {
+            genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config(10_000);
+        let bank = Bank::new_for_tests(&genesis_config);
+        let (bank, _bank_forks) = setup_dummy_fork_graph(bank);
+        let pool = SchedulerPool::<PooledScheduler<PostCommitHandler>, _>::new_for_verification(
+            Some(2),
+            None,
+            None,
+            None,
+            None,
+        );
+        let scheduler = pool.do_take_scheduler(SchedulingContext::new(bank.clone()));
+        let bank = BankWithScheduler::new(bank, Some(Box::new(scheduler)));
+        let transactions = (0..2).map(|task_id| {
+            (
+                ReplayTransaction::from(system_transaction::transfer(
+                    &mint_keypair,
+                    &solana_pubkey::new_rand(),
+                    2,
+                    genesis_config.hash(),
+                )),
+                task_id,
+            )
+        });
+        bank.schedule_transaction_executions(transactions.collect::<Vec<_>>().into_iter())
+            .unwrap();
+        assert_matches!(bank.wait_for_completed_scheduler(), Some((Ok(()), _)));
+        if qn_flags::sched_finish_before_notify() {
+            assert_eq!(POST_COMMIT_COUNT.load(Relaxed), 2);
+            assert!(UNLOCKED_BEFORE_POST_COMMIT.load(Relaxed));
+        } else {
+            assert_eq!(POST_COMMIT_COUNT.load(Relaxed), 0);
+        }
     }
 
     fn do_test_scheduler_drop_abort(abort_case: AbortCase) {

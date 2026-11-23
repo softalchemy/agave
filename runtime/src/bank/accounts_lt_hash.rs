@@ -223,6 +223,7 @@ impl Bank {
         self.accounts_lt_hash_async_progress
             .clear_is_at_end_of_slot();
         let finish_time = timer.elapsed();
+        crate::slot_tail_timing::lt_hash_finished(self.slot(), finish_time.as_micros() as u64);
 
         let seen_accounts_freelist_stats = seen_accounts_freelist().stats();
         datapoint_info!(

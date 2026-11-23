@@ -10,6 +10,7 @@ use {
     solana_bls_signatures::BlsError,
     solana_clock::Slot,
     solana_pubkey::Pubkey,
+    solana_signer_store::{Decoded, decode},
     std::collections::HashSet,
     thiserror::Error,
 };
@@ -98,6 +99,74 @@ impl ValidatedRewardCert {
         let max_validators = rank_map.len();
         let mut validators = HashSet::with_capacity(max_validators);
 
+        if crate::qn_flags::footer_cert_verify_parallel() {
+            let verify_skip = || {
+                let mut signers = Vec::new();
+                if let Some(skip) = skip {
+                    let vote = Vote::new_skip_vote(skip.slot);
+                    let payload = get_vote_payload_to_sign(vote, shred_version);
+                    let verify_start = crate::slot_tail_timing::now_if_enabled();
+                    let result = verify_base2(
+                        &payload,
+                        &skip.signature,
+                        skip.to_bitmap(),
+                        max_validators,
+                        |ind: usize| {
+                            rank_map.get_pubkey_stake_entry(ind).map(|entry| {
+                                signers.push(entry.vote_account_pubkey);
+                                entry.bls_pubkey
+                            })
+                        },
+                        crate::qn_flags::footer_cert_aggregate_pool(),
+                    );
+                    crate::slot_tail_timing::cert_verified(bank.slot(), verify_start);
+                    result?
+                }
+                Ok::<_, Error>(signers)
+            };
+            let verify_notar = || {
+                let mut signers = Vec::new();
+                if let Some(notar) = notar {
+                    let vote = Vote::new_notarization_vote(Block {
+                        slot: notar.slot,
+                        block_id: notar.block_id,
+                    });
+                    let payload = get_vote_payload_to_sign(vote, shred_version);
+                    let verify_start = crate::slot_tail_timing::now_if_enabled();
+                    let result = verify_base2(
+                        &payload,
+                        &notar.signature,
+                        notar.bitmap(),
+                        max_validators,
+                        |ind: usize| {
+                            rank_map.get_pubkey_stake_entry(ind).map(|entry| {
+                                signers.push(entry.vote_account_pubkey);
+                                entry.bls_pubkey
+                            })
+                        },
+                        crate::qn_flags::footer_cert_aggregate_pool(),
+                    );
+                    crate::slot_tail_timing::cert_verified(bank.slot(), verify_start);
+                    result?
+                }
+                Ok::<_, Error>(signers)
+            };
+            let (skip_signers, notar_signers) = if skip.is_some() && notar.is_some() {
+                crate::qn_flags::join(verify_skip, verify_notar)
+            } else {
+                (verify_skip(), verify_notar())
+            };
+            validators.extend(skip_signers?);
+            validators.extend(notar_signers?);
+            if validators.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(Self {
+                validators,
+                reward_slot,
+            }));
+        }
+
         let mut rank_map = |ind: usize| {
             rank_map.get_pubkey_stake_entry(ind).map(|entry| {
                 validators.insert(entry.vote_account_pubkey);
@@ -147,6 +216,46 @@ impl ValidatedRewardCert {
     /// tracks the validator set while aggregating them, so block production
     /// only needs the reward slot and validator set for bank reward
     /// calculation.
+    pub(crate) fn speculative(
+        bank: &Bank,
+        skip: &Option<SkipRewardCertificate>,
+        notar: &Option<NotarRewardCertificate>,
+    ) -> Option<Option<Self>> {
+        let reward_slot = match extract_slot(bank, skip, notar) {
+            Ok(Some(reward_slot)) => reward_slot,
+            Ok(None) => return Some(None),
+            Err(_) => return None,
+        };
+        let rank_map = bank
+            .epoch_stakes_from_slot(reward_slot)?
+            .bls_pubkey_to_rank_map();
+        let max_validators = rank_map.len();
+        let mut validators = HashSet::with_capacity(max_validators);
+        let bitmaps = [
+            skip.as_ref().map(|skip| skip.to_bitmap()),
+            notar.as_ref().map(|notar| notar.bitmap()),
+        ];
+        for bitmap in bitmaps.into_iter().flatten() {
+            let Ok(Decoded::Base2(ranks)) = decode(bitmap, max_validators) else {
+                return None;
+            };
+            for rank in ranks.iter_ones() {
+                validators.insert(rank_map.get_pubkey_stake_entry(rank)?.vote_account_pubkey);
+            }
+        }
+        if validators.is_empty() {
+            return Some(None);
+        }
+        Some(Some(Self {
+            validators,
+            reward_slot,
+        }))
+    }
+
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        self.reward_slot == other.reward_slot && self.validators == other.validators
+    }
+
     pub fn try_new_for_leader(
         bank: &Bank,
         skip: &Option<SkipRewardCertificate>,

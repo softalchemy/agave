@@ -1,9 +1,14 @@
 use {
-    crate::{bank::Bank, validated_reward_certificate::ValidatedRewardCert},
+    crate::{
+        bank::Bank, qn_flags, slot_tail_timing,
+        validated_reward_certificate::ValidatedRewardCert,
+    },
     agave_votor_messages::migration::AG_MIGRATION_EPOCH_CREDIT,
     epoch_inflation_account_state::{EpochInflationAccountState, EpochInflationState},
     log::info,
+    rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator},
     solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
+    solana_accounts_db::accounts::{LARGE_STORE_GEYSER_NOTIFY_NS, LARGE_STORE_NUM_ACCOUNTS},
     solana_clock::{Epoch, Slot},
     solana_pubkey::Pubkey,
     solana_svm::rent_calculator::RENT_EXEMPT_RENT_EPOCH,
@@ -15,6 +20,7 @@ use {
     std::{
         collections::{HashMap, HashSet, VecDeque, hash_map::Entry},
         num::NonZero,
+        sync::atomic::Ordering::Relaxed,
     },
     thiserror::Error,
 };
@@ -374,7 +380,17 @@ fn update_accounts(
     vote_accounts: &HashMap<Pubkey, (u64, VoteAccount)>,
     mut updated_accounts: HashMap<Pubkey, VoteState>,
     validators: impl Iterator<Item = Pubkey>,
+    parallel: bool,
 ) -> Result<Vec<(Pubkey, AccountSharedData)>, CalcVoteRewardUpdateVoteStatesError> {
+    if parallel {
+        return update_accounts_parallel(
+            reward_state,
+            final_cert_state,
+            vote_accounts,
+            updated_accounts,
+            validators.collect(),
+        );
+    }
     let mut leader_reward = 0;
     for validator in validators {
         let Some(mut vote_state) = VoteState::try_new(vote_accounts, validator) else {
@@ -429,11 +445,57 @@ pub(super) fn calc_vote_rewards_update_vote_states(
     final_cert_input: Option<(&HashSet<Pubkey>, Slot)>,
     block_producer_time_nanos: i64,
 ) -> Result<(), CalcVoteRewardUpdateVoteStatesError> {
-    let Some(updated_accounts) = allocate_updated_accounts(bank, &reward_cert, &final_cert_input)?
+    if let Some(updated_accounts) = compute_vote_reward_accounts(
+        bank,
+        &reward_cert,
+        final_cert_input,
+        block_producer_time_nanos,
+        qn_flags::footer_rewards_parallel(),
+    )? {
+        store_vote_reward_accounts(bank, updated_accounts);
+    }
+    Ok(())
+}
+
+pub(super) fn store_vote_reward_accounts(
+    bank: &Bank,
+    updated_accounts: Vec<(Pubkey, AccountSharedData)>,
+) {
+    slot_tail_timing::footer_accounts(bank.slot(), updated_accounts.len());
+    if qn_flags::footer_geyser_accounts_deferred() || qn_flags::footer_lt_hash_on_pool() {
+        bank.store_footer_accounts(
+            &updated_accounts,
+            qn_flags::footer_pool(),
+            qn_flags::footer_geyser_accounts_deferred(),
+            qn_flags::footer_lt_hash_on_pool(),
+        );
+    } else {
+        bank.store_accounts(
+            (bank.slot(), updated_accounts.as_slice()),
+            qn_flags::footer_rewards_parallel().then(qn_flags::footer_pool),
+        );
+    }
+    if updated_accounts.len() >= LARGE_STORE_NUM_ACCOUNTS {
+        slot_tail_timing::footer_geyser_notified(
+            bank.slot(),
+            LARGE_STORE_GEYSER_NOTIFY_NS.load(Relaxed),
+        );
+    }
+}
+
+pub(super) fn compute_vote_reward_accounts(
+    bank: &Bank,
+    reward_cert: &Option<ValidatedRewardCert>,
+    final_cert_input: Option<(&HashSet<Pubkey>, Slot)>,
+    block_producer_time_nanos: i64,
+    parallel: bool,
+) -> Result<Option<Vec<(Pubkey, AccountSharedData)>>, CalcVoteRewardUpdateVoteStatesError> {
+    slot_tail_timing::mark_first(bank.slot(), slot_tail_timing::Event::FooterComputeStart);
+    let Some(updated_accounts) = allocate_updated_accounts(bank, reward_cert, &final_cert_input)?
     else {
-        return Ok(());
+        return Ok(None);
     };
-    let reward_state = match &reward_cert {
+    let reward_state = match reward_cert {
         Some(c) => Some(RewardState::try_new(
             bank,
             c.slot(),
@@ -448,13 +510,14 @@ pub(super) fn calc_vote_rewards_update_vote_states(
     let vote_accounts = bank.vote_accounts();
 
     let updated_accounts = match (&reward_state, &final_cert_state) {
-        (None, None) => return Ok(()),
+        (None, None) => return Ok(None),
         (Some(state), None) => update_accounts(
             &reward_state,
             &final_cert_state,
             &vote_accounts,
             updated_accounts,
             state.reward_validators.iter().cloned(),
+            parallel,
         )?,
         (None, Some(state)) => update_accounts(
             &reward_state,
@@ -462,6 +525,7 @@ pub(super) fn calc_vote_rewards_update_vote_states(
             &vote_accounts,
             updated_accounts,
             state.signers.iter().cloned(),
+            parallel,
         )?,
         (Some(r_state), Some(f_state)) => update_accounts(
             &reward_state,
@@ -469,11 +533,79 @@ pub(super) fn calc_vote_rewards_update_vote_states(
             &vote_accounts,
             updated_accounts,
             r_state.reward_validators.union(f_state.signers).cloned(),
+            parallel,
         )?,
     };
 
-    bank.store_accounts((bank.slot(), updated_accounts.as_slice()), None);
-    Ok(())
+    slot_tail_timing::mark_first(bank.slot(), slot_tail_timing::Event::FooterComputeEnd);
+    Ok(Some(updated_accounts))
+}
+
+fn update_accounts_parallel(
+    reward_state: &Option<RewardState>,
+    final_cert_state: &Option<FinalCertState>,
+    vote_accounts: &HashMap<Pubkey, (u64, VoteAccount)>,
+    mut updated_accounts: HashMap<Pubkey, VoteState>,
+    validators: Vec<Pubkey>,
+) -> Result<Vec<(Pubkey, AccountSharedData)>, CalcVoteRewardUpdateVoteStatesError> {
+    let updates = qn_flags::footer_pool().install(|| {
+        validators
+            .par_iter()
+            .map(|validator| {
+                let Some(mut vote_state) = VoteState::try_new(vote_accounts, *validator) else {
+                    return Ok(None);
+                };
+                let mut leader_reward = 0;
+                let account_updated = match (reward_state, final_cert_state) {
+                    (None, None) => false,
+                    (Some(state), None) => {
+                        state.update_account(&mut vote_state, &mut leader_reward)?
+                    }
+                    (None, Some(state)) => state.update_account(&mut vote_state),
+                    (Some(reward_state), Some(final_state)) => {
+                        let reward_updated =
+                            reward_state.update_account(&mut vote_state, &mut leader_reward)?;
+                        let final_cert_updated = final_state.update_account(&mut vote_state);
+                        reward_updated || final_cert_updated
+                    }
+                };
+                Ok(Some((account_updated.then_some(vote_state), leader_reward)))
+            })
+            .collect::<Result<Vec<_>, RewardStateError>>()
+    })?;
+    let mut leader_reward = 0u64;
+    for (vote_state, validator_leader_reward) in updates.into_iter().flatten() {
+        leader_reward = leader_reward.saturating_add(validator_leader_reward);
+        if let Some(vote_state) = vote_state {
+            updated_accounts.insert(vote_state.vote_pubkey, vote_state);
+        }
+    }
+
+    if let Some(state) = &reward_state
+        && let Some(leader_reward) = NonZero::new(leader_reward)
+    {
+        match updated_accounts.entry(state.leader_vote_pubkey) {
+            Entry::Occupied(e) => {
+                state.update_leader(e.into_mut(), leader_reward);
+            }
+            Entry::Vacant(e) => {
+                if let Some(mut vote_state) =
+                    VoteState::try_new(vote_accounts, state.leader_vote_pubkey)
+                {
+                    state.update_leader(&mut vote_state, leader_reward);
+                    e.insert(vote_state);
+                }
+            }
+        }
+    }
+
+    let vote_states: Vec<VoteState> = updated_accounts.into_values().collect();
+    Ok(qn_flags::footer_pool().install(|| {
+        vote_states
+            .into_par_iter()
+            .filter_map(|vote_state| vote_state.serialize())
+            .collect()
+    }))
 }
 
 /// Computes the voting reward in Lamports.

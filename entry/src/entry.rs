@@ -249,10 +249,14 @@ impl<D> UnverifiedSignatures<D>
 where
     D: TransactionData + Send + Sync,
 {
-    fn with_capacity(capacity: usize) -> Self {
+    pub fn with_capacity(capacity: usize) -> Self {
         Self {
             signatures: Vec::with_capacity(capacity),
         }
+    }
+
+    pub fn append(&mut self, other: &mut Self) {
+        self.signatures.append(&mut other.signatures);
     }
 
     /// Verifies all collected signatures in parallel on the current rayon
@@ -459,7 +463,7 @@ impl EntryVerificationState {
     }
 }
 
-fn validate_and_hash_entry_transactions<Tx: TransactionWithMeta, F, D>(
+pub fn validate_and_hash_entry_transactions<Tx: TransactionWithMeta, F, D>(
     entry: EntryView<D>,
     verify: &F,
     unverified_signatures: &mut UnverifiedSignatures<D>,
@@ -499,6 +503,8 @@ where
     Ok(EntryType::Transactions(verified_transactions))
 }
 
+pub const PARALLEL_VERIFY_THRESHOLD: usize = 200;
+
 /// Validates and hashes the transactions included in the given entries.
 ///
 /// The function does NOT verify transaction signatures. The caller is expected to call
@@ -514,7 +520,6 @@ where
     F: Fn(UnsanitizedTransactionView<D>) -> Result<Tx> + Send + Sync,
     D: TransactionData + Clone + Send + Sync,
 {
-    const PARALLEL_VERIFY_THRESHOLD: usize = 200;
     if num_txs < PARALLEL_VERIFY_THRESHOLD {
         let mut unverified_signatures = UnverifiedSignatures::with_capacity(num_txs);
         let entries = entries

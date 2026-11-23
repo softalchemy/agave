@@ -1,11 +1,16 @@
 use {
     crate::{
-        bank::{Bank, TransactionBalancesSet},
+        bank::{
+            Bank, TransactionBalancesSet,
+            speculation::{Speculation, SpeculationInputs},
+        },
         bank_utils,
         dependency_tracker::DependencyTracker,
         prioritization_fee_cache::PrioritizationFeeCache,
+        qn_flags, slot_tail_timing,
         transaction_balances::compile_collected_balances,
         transaction_batch::TransactionBatch,
+        tx_exec_timing::{self, Part},
         vote_sender_types::{ReplayVoteSendType, ReplayVoteSender},
     },
     log::{trace, warn},
@@ -15,20 +20,26 @@ use {
     solana_runtime_transaction::transaction_with_meta::{TransactionWithMeta, writable_accounts},
     solana_signature::Signature,
     solana_svm::{
+        transaction_balances::BalanceCollector,
         transaction_commit_result::{
             TransactionCommitResult, TransactionCommitResultExtensions as _,
         },
+        transaction_processing_result::TransactionProcessingResult,
         transaction_processor::ExecutionRecordingConfig,
     },
     solana_svm_timings::{ExecuteTimingType, ExecuteTimings},
-    solana_svm_transaction::{svm_message::SVMMessage, svm_transaction::SVMTransaction},
     solana_transaction::sanitized::SanitizedTransaction,
     solana_transaction_error::{TransactionError, TransactionResult},
     solana_transaction_status::token_balances::TransactionTokenBalancesSet,
-    std::{borrow::Cow, sync::Arc},
+    std::sync::{Arc, OnceLock},
 };
 
 type WorkSequence = u64;
+
+pub type InlineTransactionStatusHandler = Box<dyn Fn(TransactionStatusBatch) + Send + Sync>;
+
+pub static INLINE_TRANSACTION_STATUS_HANDLER: OnceLock<InlineTransactionStatusHandler> =
+    OnceLock::new();
 
 #[derive(Debug)]
 pub struct TransactionStatusBatch {
@@ -49,9 +60,89 @@ pub enum TransactionStatusMessage {
     Freeze(Arc<Bank>),
 }
 
-pub struct TransactionBatchWithIndexes<'a, 'b, Tx: SVMMessage> {
+pub struct TransactionBatchWithIndexes<'a, 'b, Tx: TransactionWithMeta> {
     pub batch: TransactionBatch<'a, 'b, Tx>,
     pub transaction_indexes: Vec<usize>,
+}
+
+#[derive(Default)]
+pub struct BatchPostCommit {
+    commit_results: Vec<TransactionCommitResult>,
+    balance_collector: Option<BalanceCollector>,
+    costs: Vec<Option<u64>>,
+    transaction_indexes: Vec<usize>,
+    status_sent: bool,
+}
+
+const SVM_TIMINGS: [ExecuteTimingType; 9] = [
+    ExecuteTimingType::CheckUs,
+    ExecuteTimingType::ValidateFeesUs,
+    ExecuteTimingType::LoadUs,
+    ExecuteTimingType::CollectBalancesUs,
+    ExecuteTimingType::FilterExecutableUs,
+    ExecuteTimingType::ProgramCacheUs,
+    ExecuteTimingType::ExecuteUs,
+    ExecuteTimingType::UpdateStakesCacheUs,
+    ExecuteTimingType::UpdateTransactionStatuses,
+];
+
+fn svm_timings(timings: &ExecuteTimings) -> [u64; 9] {
+    SVM_TIMINGS.map(|kind| timings.metrics[kind].0)
+}
+
+fn record_svm_parts(before: [u64; 9], timings: &ExecuteTimings) {
+    let after = svm_timings(timings);
+    let elapsed = |index: usize| after[index].saturating_sub(before[index]) * 1_000;
+    let program_cache = elapsed(4) + elapsed(5);
+    tx_exec_timing::part_add_ns(Part::Check, elapsed(0));
+    tx_exec_timing::part_add_ns(Part::FeePayer, elapsed(1));
+    tx_exec_timing::part_add_ns(Part::Load, elapsed(2));
+    tx_exec_timing::part_add_ns(Part::Balances, elapsed(3));
+    tx_exec_timing::part_add_ns(Part::ProgramCache, program_cache);
+    tx_exec_timing::part_add_ns(Part::Execute, elapsed(6).saturating_sub(program_cache));
+    tx_exec_timing::part_add_ns(Part::StakesCache, elapsed(7));
+    tx_exec_timing::part_add_ns(Part::StatusCache, elapsed(8));
+}
+
+fn status_costs(tx_costs: Vec<Option<TransactionCost>>) -> Vec<Option<u64>> {
+    tx_costs
+        .into_iter()
+        .map(|tx_cost_option| tx_cost_option.map(|tx_cost| tx_cost.sum()).or(Some(0)))
+        .collect()
+}
+
+fn send_transaction_status(
+    transactions: &[impl TransactionWithMeta],
+    bank: &Arc<Bank>,
+    transaction_status_sender: &TransactionStatusSender,
+    commit_results: Vec<TransactionCommitResult>,
+    balance_collector: Option<BalanceCollector>,
+    costs: Vec<Option<u64>>,
+    transaction_indexes: Vec<usize>,
+    timing_start: u64,
+) {
+    let transactions: Vec<SanitizedTransaction> = transactions
+        .iter()
+        .map(|tx| tx.as_sanitized_transaction().into_owned())
+        .collect();
+
+    debug_assert!(balance_collector.is_some());
+
+    let (balances, token_balances) =
+        compile_collected_balances(balance_collector.unwrap_or_default());
+    let timing_start = tx_exec_timing::part_add(Part::StatusBuild, timing_start);
+
+    transaction_status_sender.send_transaction_status_batch(
+        bank.slot(),
+        bank.bank_id(),
+        transactions,
+        commit_results,
+        balances,
+        token_balances,
+        costs,
+        transaction_indexes,
+    );
+    tx_exec_timing::part_add(Part::Notify, timing_start);
 }
 
 pub fn execute_batch<'a>(
@@ -64,27 +155,129 @@ pub fn execute_batch<'a>(
     log_messages_bytes_limit: Option<usize>,
     prioritization_fee_cache: Option<&'a PrioritizationFeeCache>,
 ) -> TransactionResult<()> {
+    let post_commit = execute_batch_until_commit(
+        batch,
+        bank,
+        transaction_status_sender,
+        replay_vote_sender,
+        replay_vote_send_type,
+        timings,
+        log_messages_bytes_limit,
+    )?;
+    finish_batch_after_commit(
+        batch.batch.sanitized_transactions(),
+        bank,
+        transaction_status_sender,
+        prioritization_fee_cache,
+        post_commit,
+    );
+
+    Ok(())
+}
+
+pub fn execute_batch_until_commit<'a>(
+    batch: &'a TransactionBatchWithIndexes<impl TransactionWithMeta>,
+    bank: &'a Arc<Bank>,
+    transaction_status_sender: Option<&'a TransactionStatusSender>,
+    replay_vote_sender: Option<&'a ReplayVoteSender>,
+    replay_vote_send_type: ReplayVoteSendType,
+    timings: &'a mut ExecuteTimings,
+    log_messages_bytes_limit: Option<usize>,
+) -> TransactionResult<BatchPostCommit> {
+    execute_batch_until_commit_with_speculation(
+        batch,
+        bank,
+        transaction_status_sender,
+        replay_vote_sender,
+        replay_vote_send_type,
+        timings,
+        log_messages_bytes_limit,
+        None,
+    )
+}
+
+pub fn speculate_batch(
+    batch: &TransactionBatch<impl TransactionWithMeta>,
+    record_transaction_status: bool,
+    log_messages_bytes_limit: Option<usize>,
+    inputs: &Arc<SpeculationInputs>,
+) -> Option<Speculation> {
+    batch.bank().speculate_transactions(
+        batch,
+        ExecutionRecordingConfig::new_single_setting(record_transaction_status),
+        log_messages_bytes_limit,
+        inputs,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn execute_batch_until_commit_with_speculation<'a>(
+    batch: &'a TransactionBatchWithIndexes<impl TransactionWithMeta>,
+    bank: &'a Arc<Bank>,
+    transaction_status_sender: Option<&'a TransactionStatusSender>,
+    replay_vote_sender: Option<&'a ReplayVoteSender>,
+    replay_vote_send_type: ReplayVoteSendType,
+    timings: &'a mut ExecuteTimings,
+    log_messages_bytes_limit: Option<usize>,
+    speculation: Option<Speculation>,
+) -> TransactionResult<BatchPostCommit> {
     let TransactionBatchWithIndexes {
         batch,
         transaction_indexes,
     } = batch;
+    let record_transaction_status = transaction_status_sender.is_some();
+    let notify_before_commit =
+        transaction_status_sender.filter(|_| qn_flags::geyser_tx_notify_before_commit());
+    let mut status_sent = false;
 
-    let transaction_indexes = Cow::from(transaction_indexes);
+    tx_exec_timing::exec_start(bank.slot(), transaction_indexes);
+    let timings_before = tx_exec_timing::enabled().then(|| svm_timings(timings));
 
-    let pre_commit_callback = |processing_results: &_| -> TransactionResult<()> {
+    let pre_commit_callback = |processing_results: &mut Vec<TransactionProcessingResult>,
+                               balance_collector: &mut Option<BalanceCollector>|
+     -> TransactionResult<()> {
         // We're entering into one of the block-verification methods.
-        get_first_error(batch, processing_results)
+        get_first_error(batch, processing_results.as_slice())?;
+        if let Some(transaction_status_sender) = notify_before_commit {
+            let timing_start = tx_exec_timing::part_start();
+            let commit_results = Bank::take_commit_results_before_commit(processing_results);
+            let costs = status_costs(get_transaction_costs(
+                bank,
+                &commit_results,
+                batch.sanitized_transactions(),
+            ));
+            send_transaction_status(
+                batch.sanitized_transactions(),
+                bank,
+                transaction_status_sender,
+                commit_results,
+                balance_collector.take(),
+                costs,
+                transaction_indexes.clone(),
+                timing_start,
+            );
+            status_sent = true;
+        }
+        Ok(())
     };
 
     let (commit_results, balance_collector) = batch
         .bank()
-        .load_execute_and_commit_transactions_with_pre_commit_callback(
+        .load_execute_and_commit_transactions_with_pre_commit_access_and_speculation(
             batch,
-            ExecutionRecordingConfig::new_single_setting(transaction_status_sender.is_some()),
+            ExecutionRecordingConfig::new_single_setting(record_transaction_status),
             timings,
             log_messages_bytes_limit,
             pre_commit_callback,
+            speculation,
         )?;
+    slot_tail_timing::tx_committed(bank.slot());
+    crate::shred_to_tx_timing::committed(bank.slot(), transaction_indexes);
+    if let Some(timings_before) = timings_before {
+        record_svm_parts(timings_before, timings);
+    }
+    tx_exec_timing::committed(bank.slot(), transaction_indexes);
+    let timing_start = tx_exec_timing::part_start();
 
     let mut check_block_costs_elapsed = Measure::start("check_block_costs");
 
@@ -97,6 +290,12 @@ pub fn execute_batch<'a>(
         ExecuteTimingType::CheckBlockLimitsUs,
         check_block_costs_elapsed.as_us(),
     );
+    let timing_start = tx_exec_timing::part_set(
+        bank.slot(),
+        transaction_indexes,
+        Part::CostTracker,
+        timing_start,
+    );
 
     checked_tx_costs_result?;
 
@@ -106,53 +305,73 @@ pub fn execute_batch<'a>(
         replay_vote_sender,
         replay_vote_send_type,
     );
+    tx_exec_timing::part_set(
+        bank.slot(),
+        transaction_indexes,
+        Part::VoteSend,
+        timing_start,
+    );
 
-    if let Some(prioritization_fee_cache) = prioritization_fee_cache {
-        let fee_paying_transactions = commit_results
-            .iter()
-            .zip(batch.sanitized_transactions())
-            .filter_map(|(commit_result, tx)| commit_result.was_fee_paying().then_some(tx));
-        prioritization_fee_cache.update(bank, fee_paying_transactions);
-    }
-    if let Some(transaction_status_sender) = transaction_status_sender {
-        let transactions: Vec<SanitizedTransaction> = batch
-            .sanitized_transactions()
-            .iter()
-            .map(|tx| tx.as_sanitized_transaction().into_owned())
-            .collect();
-
-        // There are two cases where balance_collector could be None:
-        // * Balance recording is disabled. If that were the case, there would
-        //   be no TransactionStatusSender, and we would not be in this branch.
-        // * The batch was aborted in its entirety in SVM. In that case, nothing
-        //   would have been committed.
-        // Therefore this should always be true.
-        debug_assert!(balance_collector.is_some());
-
-        let (balances, token_balances) =
-            compile_collected_balances(balance_collector.unwrap_or_default());
-
+    let (costs, transaction_indexes) = if record_transaction_status {
         // The length of costs vector needs to be consistent with all other
         // vectors that are sent over (such as `transactions`). So, replace the
         // None elements with Some(0)
-        let tx_costs = tx_costs
-            .into_iter()
-            .map(|tx_cost_option| tx_cost_option.map(|tx_cost| tx_cost.sum()).or(Some(0)))
-            .collect();
+        (status_costs(tx_costs), transaction_indexes.clone())
+    } else {
+        (vec![], vec![])
+    };
 
-        transaction_status_sender.send_transaction_status_batch(
-            bank.slot(),
-            bank.bank_id(),
+    Ok(BatchPostCommit {
+        commit_results,
+        balance_collector,
+        costs,
+        transaction_indexes,
+        status_sent,
+    })
+}
+
+pub fn finish_batch_after_commit(
+    transactions: &[impl TransactionWithMeta],
+    bank: &Arc<Bank>,
+    transaction_status_sender: Option<&TransactionStatusSender>,
+    prioritization_fee_cache: Option<&PrioritizationFeeCache>,
+    post_commit: BatchPostCommit,
+) {
+    let BatchPostCommit {
+        commit_results,
+        balance_collector,
+        costs,
+        transaction_indexes,
+        status_sent,
+    } = post_commit;
+
+    let timing_start = tx_exec_timing::part_start();
+    if let Some(prioritization_fee_cache) = prioritization_fee_cache {
+        let fee_paying_transactions = commit_results
+            .iter()
+            .zip(transactions)
+            .filter_map(|(commit_result, tx)| commit_result.was_fee_paying().then_some(tx));
+        prioritization_fee_cache.update(bank, fee_paying_transactions);
+    }
+    let timing_start = tx_exec_timing::part_add(Part::PrioFee, timing_start);
+    let timed = (timing_start != 0).then(|| transaction_indexes.clone());
+    if let Some(transaction_status_sender) = transaction_status_sender
+        && !status_sent
+    {
+        send_transaction_status(
             transactions,
+            bank,
+            transaction_status_sender,
             commit_results,
-            balances,
-            token_balances,
-            tx_costs,
-            transaction_indexes.into_owned(),
+            balance_collector,
+            costs,
+            transaction_indexes,
+            timing_start,
         );
     }
-
-    Ok(())
+    if let Some(transaction_indexes) = timed {
+        tx_exec_timing::post_commit_parts(bank.slot(), &transaction_indexes);
+    }
 }
 
 fn check_block_cost_limits<Tx: TransactionWithMeta>(
@@ -199,7 +418,7 @@ fn get_transaction_costs<Tx: TransactionWithMeta>(
         .collect()
 }
 
-fn get_first_error<T, Tx: SVMTransaction>(
+fn get_first_error<T, Tx: TransactionWithMeta>(
     batch: &TransactionBatch<Tx>,
     commit_results: &[TransactionResult<T>],
 ) -> TransactionResult<()> {
@@ -209,7 +428,7 @@ fn get_first_error<T, Tx: SVMTransaction>(
 }
 
 // Includes transaction signature for unit-testing
-fn do_get_first_error<T, Tx: SVMTransaction>(
+fn do_get_first_error<T, Tx: TransactionWithMeta>(
     batch: &TransactionBatch<Tx>,
     results: &[TransactionResult<T>],
 ) -> Option<(TransactionResult<()>, Signature)> {
@@ -251,24 +470,30 @@ impl TransactionStatusSender {
         costs: Vec<Option<u64>>,
         transaction_indexes: Vec<usize>,
     ) {
+        let batch = TransactionStatusBatch {
+            slot,
+            bank_id,
+            transactions,
+            commit_results,
+            balances,
+            token_balances,
+            costs,
+            transaction_indexes,
+        };
+        if let Some(handler) = INLINE_TRANSACTION_STATUS_HANDLER.get() {
+            handler(batch);
+            return;
+        }
+
         let work_sequence = self
             .dependency_tracker
             .as_ref()
             .map(|dependency_tracker| dependency_tracker.declare_work());
 
-        if let Err(e) = self.sender.send(TransactionStatusMessage::Batch((
-            TransactionStatusBatch {
-                slot,
-                bank_id,
-                transactions,
-                commit_results,
-                balances,
-                token_balances,
-                costs,
-                transaction_indexes,
-            },
-            work_sequence,
-        ))) {
+        if let Err(e) = self
+            .sender
+            .send(TransactionStatusMessage::Batch((batch, work_sequence)))
+        {
             trace!("Slot {slot} transaction_status send batch failed: {e:?}");
         }
     }
