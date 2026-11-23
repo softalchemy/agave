@@ -24,6 +24,7 @@ pub mod loader_utils;
 pub mod non_circulating_supply;
 pub mod prioritization_fee;
 pub mod prioritization_fee_cache;
+pub mod qn_flags;
 mod read_optimized_dashmap;
 pub mod rent_collector;
 mod reward_info;

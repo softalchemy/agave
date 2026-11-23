@@ -24,10 +24,18 @@ use {
     solana_transaction::sanitized::SanitizedTransaction,
     solana_transaction_error::{TransactionError, TransactionResult},
     solana_transaction_status::token_balances::TransactionTokenBalancesSet,
-    std::{borrow::Cow, sync::Arc},
+    std::{
+        borrow::Cow,
+        sync::{Arc, OnceLock},
+    },
 };
 
 type WorkSequence = u64;
+
+pub type InlineTransactionStatusHandler = Box<dyn Fn(TransactionStatusBatch) + Send + Sync>;
+
+pub static INLINE_TRANSACTION_STATUS_HANDLER: OnceLock<InlineTransactionStatusHandler> =
+    OnceLock::new();
 
 #[derive(Debug)]
 pub struct TransactionStatusBatch {
@@ -250,24 +258,30 @@ impl TransactionStatusSender {
         costs: Vec<Option<u64>>,
         transaction_indexes: Vec<usize>,
     ) {
+        let batch = TransactionStatusBatch {
+            slot,
+            bank_id,
+            transactions,
+            commit_results,
+            balances,
+            token_balances,
+            costs,
+            transaction_indexes,
+        };
+        if let Some(handler) = INLINE_TRANSACTION_STATUS_HANDLER.get() {
+            handler(batch);
+            return;
+        }
+
         let work_sequence = self
             .dependency_tracker
             .as_ref()
             .map(|dependency_tracker| dependency_tracker.declare_work());
 
-        if let Err(e) = self.sender.send(TransactionStatusMessage::Batch((
-            TransactionStatusBatch {
-                slot,
-                bank_id,
-                transactions,
-                commit_results,
-                balances,
-                token_balances,
-                costs,
-                transaction_indexes,
-            },
-            work_sequence,
-        ))) {
+        if let Err(e) = self
+            .sender
+            .send(TransactionStatusMessage::Batch((batch, work_sequence)))
+        {
             trace!("Slot {slot} transaction_status send batch failed: {e:?}");
         }
     }

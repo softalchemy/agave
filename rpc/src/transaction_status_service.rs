@@ -12,7 +12,10 @@ use {
     solana_runtime::{
         bank::{Bank, KeyedRewardsAndNumPartitions},
         dependency_tracker::DependencyTracker,
-        transaction_execution::{TransactionStatusBatch, TransactionStatusMessage},
+        qn_flags,
+        transaction_execution::{
+            INLINE_TRANSACTION_STATUS_HANDLER, TransactionStatusBatch, TransactionStatusMessage,
+        },
     },
     solana_svm::transaction_commit_result::CommittedTransaction,
     solana_transaction::sanitized::SanitizedTransaction,
@@ -76,6 +79,31 @@ impl TransactionStatusService {
         exit: Arc<AtomicBool>,
     ) -> Self {
         let (write_job_sender, write_job_receiver) = unbounded::<BlockstoreWriteJob>();
+        let notify_inline = qn_flags::geyser_tx_notify_inline() && transaction_notifier.is_some();
+        if notify_inline {
+            let transaction_notifier = transaction_notifier.clone();
+            let write_job_sender = write_job_sender.clone();
+            let installed = INLINE_TRANSACTION_STATUS_HANDLER
+                .set(Box::new(move |batch| {
+                    let _ = Self::write_transaction_status_batch(
+                        TransactionStatusMessage::Batch((batch, None)),
+                        enable_rpc_transaction_history,
+                        transaction_notifier.clone(),
+                        enable_extended_tx_metadata_storage,
+                        None,
+                        &write_job_sender,
+                    );
+                }))
+                .is_ok();
+            if installed {
+                info!("{} geyser transaction notify inline", Self::SERVICE_NAME);
+            } else {
+                warn!(
+                    "{} inline transaction status handler already installed",
+                    Self::SERVICE_NAME
+                );
+            }
+        }
         let writer_hdl = Builder::new()
             .name("solTxStatusBsWr".to_string())
             .spawn({
@@ -88,7 +116,12 @@ impl TransactionStatusService {
                         let job = match write_job_receiver.recv_timeout(Duration::from_secs(1)) {
                             Ok(job) => job,
                             Err(RecvTimeoutError::Disconnected) => break,
-                            Err(RecvTimeoutError::Timeout) => continue,
+                            Err(RecvTimeoutError::Timeout) => {
+                                if notify_inline && exit.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                continue;
+                            }
                         };
                         if let Err(err) = Self::run_blockstore_write_job(
                             job,
@@ -129,10 +162,8 @@ impl TransactionStatusService {
 
                         match Self::write_transaction_status_batch(
                             message,
-                            &max_complete_transaction_status_slot,
                             enable_rpc_transaction_history,
                             transaction_notifier.clone(),
-                            &blockstore,
                             enable_extended_tx_metadata_storage,
                             depenency_tracker.clone(),
                             &write_job_sender,
@@ -160,15 +191,12 @@ impl TransactionStatusService {
 
     fn write_transaction_status_batch(
         transaction_status_message: TransactionStatusMessage,
-        max_complete_transaction_status_slot: &Arc<AtomicU64>,
         enable_rpc_transaction_history: bool,
         transaction_notifier: Option<TransactionNotifierArc>,
-        blockstore: &Blockstore,
         enable_extended_tx_metadata_storage: bool,
         dependency_tracker: Option<Arc<DependencyTracker>>,
         write_job_sender: &Sender<BlockstoreWriteJob>,
     ) -> Result<()> {
-        let _ = (max_complete_transaction_status_slot, blockstore);
         match transaction_status_message {
             TransactionStatusMessage::Batch((
                 TransactionStatusBatch {
