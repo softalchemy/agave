@@ -8,7 +8,7 @@ use {
         ops::Range,
         sync::{
             LazyLock,
-            atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed},
+            atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering::Relaxed},
         },
         time::{Duration, Instant},
     },
@@ -35,6 +35,25 @@ const REPORT_AFTER_CREATED: u64 = 10_000_000_000;
 const FLAG_RECOVERED: u32 = 1;
 const FLAG_PUBLISHED: u32 = 2;
 const FLAG_FAST: u32 = 4;
+const FLAG_STREAMED: u32 = 8;
+const STREAM_LEADS_LEN: usize = 4096;
+const STREAM_COUNTS_LEN: usize = 11;
+
+#[derive(Clone, Copy)]
+#[repr(usize)]
+pub enum StreamCount {
+    Chunks,
+    ChunksPulled,
+    Shreds,
+    Entries,
+    Txs,
+    StopMarker,
+    StopEntryCount,
+    StopTick,
+    StopOversize,
+    StopComponent,
+    Mismatch,
+}
 
 #[derive(Clone, Copy)]
 #[repr(usize)]
@@ -145,10 +164,6 @@ impl SetRecord {
         self.stamps[stamp as usize].store(now, Relaxed);
     }
 
-    fn set_first(&self, stamp: Stamp, now: u64) {
-        let _ = self.stamps[stamp as usize].compare_exchange(0, now, Relaxed, Relaxed);
-    }
-
     fn delta_us(&self, from: Stamp, to: Stamp) -> Option<i64> {
         match (self.get(from), self.get(to)) {
             (0, _) | (_, 0) => None,
@@ -168,6 +183,13 @@ struct SlotRecord {
     by_tx_len: AtomicU32,
     by_tx: [AtomicU64; SETS_LEN],
     first_by_ingress: [AtomicU32; INGRESS_MASK as usize + 1],
+    stream_counts: [AtomicU32; STREAM_COUNTS_LEN],
+    stream_leads_len: AtomicU32,
+    stream_lead_sum: AtomicI64,
+    stream_leads: [AtomicI32; STREAM_LEADS_LEN],
+    stream_tx_start: AtomicU32,
+    stream_tx_end: AtomicU32,
+    stream_stamps: [AtomicU64; 4],
     sets: [SetRecord; SETS_LEN],
 }
 
@@ -184,6 +206,13 @@ impl SlotRecord {
             by_tx_len: AtomicU32::new(0),
             by_tx: [const { AtomicU64::new(0) }; SETS_LEN],
             first_by_ingress: [const { AtomicU32::new(0) }; INGRESS_MASK as usize + 1],
+            stream_counts: [const { AtomicU32::new(0) }; STREAM_COUNTS_LEN],
+            stream_leads_len: AtomicU32::new(0),
+            stream_lead_sum: AtomicI64::new(0),
+            stream_leads: [const { AtomicI32::new(0) }; STREAM_LEADS_LEN],
+            stream_tx_start: AtomicU32::new(0),
+            stream_tx_end: AtomicU32::new(0),
+            stream_stamps: [const { AtomicU64::new(0) }; 4],
             sets: [const { SetRecord::new() }; SETS_LEN],
         }
     }
@@ -198,6 +227,12 @@ impl SlotRecord {
             .enumerate()
             .rev()
             .find(|(_, set)| set.end.load(Relaxed) == end)
+    }
+
+    fn stream_stamps(&self, tx_index: usize) -> Option<&[AtomicU64; 4]> {
+        ((self.stream_tx_start.load(Relaxed) as usize..self.stream_tx_end.load(Relaxed) as usize)
+            .contains(&tx_index))
+        .then_some(&self.stream_stamps)
     }
 
     fn set_by_tx(&self, tx_index: usize) -> Option<&SetRecord> {
@@ -307,6 +342,14 @@ fn claim(slot: Slot) -> Option<&'static SlotRecord> {
         .first_by_ingress
         .iter()
         .for_each(|count| count.store(0, Relaxed));
+    record
+        .stream_counts
+        .iter()
+        .for_each(|count| count.store(0, Relaxed));
+    record.stream_leads_len.store(0, Relaxed);
+    record.stream_lead_sum.store(0, Relaxed);
+    record.stream_tx_start.store(0, Relaxed);
+    record.stream_tx_end.store(0, Relaxed);
     record.created.store(now(), Relaxed);
     record.slot.store(slot, Relaxed);
     Some(record)
@@ -620,6 +663,100 @@ pub fn entry_batch(slot: Slot, range_end: u32, tx_start: usize, num_txs: usize) 
     }
 }
 
+pub fn stream_count(slot: Slot, count: StreamCount, value: usize) {
+    if !enabled() {
+        return;
+    }
+    if let Some(record) = claim(slot) {
+        record.stream_counts[count as usize].fetch_add(value as u32, Relaxed);
+    }
+}
+
+pub fn stream_released(slot: Slot, tx_start: usize, num_entries: usize, num_txs: usize) -> u64 {
+    if !enabled() {
+        return 0;
+    }
+    CURRENT_SET.set(None);
+    stream_count(slot, StreamCount::Entries, num_entries);
+    stream_count(slot, StreamCount::Txs, num_txs);
+    if let Some(record) = record(slot) {
+        if record.stream_tx_end.load(Relaxed) as usize != tx_start
+            || record.stream_tx_start.load(Relaxed) == record.stream_tx_end.load(Relaxed)
+        {
+            record.stream_tx_end.store(tx_start as u32, Relaxed);
+            record.stream_tx_start.store(tx_start as u32, Relaxed);
+            record
+                .stream_stamps
+                .iter()
+                .for_each(|stamp| stamp.store(0, Relaxed));
+        }
+        record
+            .stream_tx_end
+            .store(tx_start.saturating_add(num_txs) as u32, Relaxed);
+    }
+    now()
+}
+
+fn stamp_first(stamp: &AtomicU64, now: u64) {
+    let _ = stamp.fetch_update(Relaxed, Relaxed, |current| {
+        (now != 0 && (current == 0 || now < current)).then_some(now)
+    });
+}
+
+pub fn stream_set_done(
+    slot: Slot,
+    range_end: u32,
+    releases: &[(u64, u32)],
+    num_txs_remaining: usize,
+) {
+    if !enabled() {
+        return;
+    }
+    let Some(record) = record(slot) else {
+        return;
+    };
+    if num_txs_remaining == 0 {
+        CURRENT_SET.set(None);
+    }
+    let now = now();
+    let complete = record
+        .set_by_end(range_end)
+        .map(|(_, set)| {
+            set.flags.fetch_or(FLAG_STREAMED, Relaxed);
+            if let Some((released, _)) = releases.last() {
+                set.set(Stamp::Scheduled, *released);
+            }
+            if record.stream_tx_start.load(Relaxed) == set.tx_start.load(Relaxed)
+                && record.stream_tx_end.load(Relaxed) <= set.tx_end.load(Relaxed)
+            {
+                record.stream_tx_end.store(0, Relaxed);
+                record.stream_tx_start.store(0, Relaxed);
+                let stream_stamp = |index: usize| record.stream_stamps[index].load(Relaxed);
+                stamp_first(&set.stamps[Stamp::FirstCommit as usize], stream_stamp(0));
+                set.stamps[Stamp::LastCommit as usize].fetch_max(stream_stamp(1), Relaxed);
+                stamp_first(&set.stamps[Stamp::FirstNotify as usize], stream_stamp(2));
+                set.stamps[Stamp::LastNotify as usize].fetch_max(stream_stamp(3), Relaxed);
+            }
+            match (set.get(Stamp::Available), set.get(Stamp::InsertDone)) {
+                (0, 0) => now,
+                (0, insert_done) => insert_done,
+                (available, _) => available,
+            }
+        })
+        .unwrap_or(now);
+    for (released, num_txs) in releases {
+        let lead =
+            ((complete as i64 - *released as i64) / 1_000).clamp(i32::MIN as i64, i32::MAX as i64);
+        for _ in 0..*num_txs {
+            let index = record.stream_leads_len.fetch_add(1, Relaxed) as usize;
+            if let Some(slot_lead) = record.stream_leads.get(index) {
+                slot_lead.store(lead as i32, Relaxed);
+                record.stream_lead_sum.fetch_add(lead, Relaxed);
+            }
+        }
+    }
+}
+
 pub fn scheduled(slot: Slot) {
     if !enabled() {
         return;
@@ -646,8 +783,11 @@ pub fn committed(slot: Slot, transaction_indexes: &[usize]) {
     let now = now();
     for tx_index in [first, last] {
         if let Some(set) = record.set_by_tx(*tx_index) {
-            set.set_first(Stamp::FirstCommit, now);
+            stamp_first(&set.stamps[Stamp::FirstCommit as usize], now);
             set.stamps[Stamp::LastCommit as usize].fetch_max(now, Relaxed);
+        } else if let Some(stamps) = record.stream_stamps(*tx_index) {
+            stamp_first(&stamps[0], now);
+            stamps[1].fetch_max(now, Relaxed);
         }
         if first == last {
             break;
@@ -659,12 +799,17 @@ pub fn notified(slot: Slot, transaction_index: usize) {
     if !enabled() {
         return;
     }
-    if let Some(record) = record(slot)
-        && let Some(set) = record.set_by_tx(transaction_index)
-    {
+    let Some(record) = record(slot) else {
+        return;
+    };
+    if let Some(set) = record.set_by_tx(transaction_index) {
         let now = now();
-        set.set_first(Stamp::FirstNotify, now);
+        stamp_first(&set.stamps[Stamp::FirstNotify as usize], now);
         set.stamps[Stamp::LastNotify as usize].fetch_max(now, Relaxed);
+    } else if let Some(stamps) = record.stream_stamps(transaction_index) {
+        let now = now();
+        stamp_first(&stamps[2], now);
+        stamps[3].fetch_max(now, Relaxed);
     }
 }
 
@@ -738,6 +883,20 @@ const STAGES: [([&str; 4], Stamp, Stamp); 16] = [
         Stamp::Committed,
     ),
 ];
+const STREAM_LEAD: [&str; 4] = names!("stream_lead");
+const STREAM_COUNT_NAMES: [&str; STREAM_COUNTS_LEN] = [
+    "stream_chunks",
+    "stream_chunks_pulled",
+    "stream_shreds",
+    "entries_streamed",
+    "txs_streamed",
+    "stream_stop_marker",
+    "stream_stop_entry_count",
+    "stream_stop_tick",
+    "stream_stop_oversize",
+    "stream_stop_component",
+    "stream_mismatch",
+];
 const RECV_TO_LAST_NOTIFY: [&str; 4] = names!("recv_to_last_notify");
 const AVAILABLE_TO_WAKEUP: [&str; 4] = names!("available_to_wakeup");
 const BANK_WAIT: [&str; 4] = names!("bank_wait");
@@ -774,7 +933,7 @@ fn build_report(record: &SlotRecord, slot: Slot) -> Vec<(&'static str, i64)> {
     let is_recovered = |set: &&SetRecord| set.flags.load(Relaxed) & FLAG_RECOVERED != 0;
     let tx_sets: Vec<&SetRecord> = sets.iter().filter(has_txs).collect();
     let first_pass = record.first_pass.load(Relaxed);
-    let mut fields = Vec::with_capacity(160);
+    let mut fields = Vec::with_capacity(180);
     fields.push(("slot", slot as i64));
     fields.push(("frozen", (record.frozen.load(Relaxed) != 0) as i64));
     fields.push(("sets", sets.len() as i64));
@@ -829,6 +988,33 @@ fn build_report(record: &SlotRecord, slot: Slot) -> Vec<(&'static str, i64)> {
             .map(|set| (set.tx_end.load(Relaxed) - set.tx_start.load(Relaxed)) as i64)
             .sum(),
     ));
+    fields.push((
+        "sets_streamed",
+        sets.iter()
+            .filter(|set| set.flags.load(Relaxed) & FLAG_STREAMED != 0)
+            .count() as i64,
+    ));
+    for (name, count) in STREAM_COUNT_NAMES.into_iter().zip(&record.stream_counts) {
+        fields.push((name, count.load(Relaxed) as i64));
+    }
+    let leads: Vec<i64> = record.stream_leads
+        [..(record.stream_leads_len.load(Relaxed) as usize).min(STREAM_LEADS_LEN)]
+        .iter()
+        .map(|lead| lead.load(Relaxed) as i64)
+        .collect();
+    fields.push((
+        "stream_lead_mean_us",
+        if leads.is_empty() {
+            UNSET
+        } else {
+            record.stream_lead_sum.load(Relaxed) / leads.len() as i64
+        },
+    ));
+    fields.push((
+        "txs_streamed_late",
+        leads.iter().filter(|lead| **lead <= 0).count() as i64,
+    ));
+    push_stats(&mut fields, STREAM_LEAD, leads);
     for (name, count) in FIRST_BY_INGRESS.into_iter().zip(&record.first_by_ingress) {
         fields.push((name, count.load(Relaxed) as i64));
     }
@@ -1014,6 +1200,78 @@ mod tests {
         assert!(field("insert_to_commit_min_us") <= 0);
         assert!(field("insert_min_us") >= 300);
         assert!(field("insert_max_us") >= 900);
+    }
+
+    #[test]
+    fn test_stream_counters_and_leads() {
+        let slot = 920_000_000 + 6;
+        let pause = || std::thread::sleep(Duration::from_micros(300));
+        stream_count(slot, StreamCount::Chunks, 3);
+        stream_count(slot, StreamCount::ChunksPulled, 1);
+        stream_count(slot, StreamCount::Shreds, 20);
+        claim(slot).unwrap();
+        notified(slot, 0);
+        let first = stream_released(slot, 0, 2, 3);
+        committed(slot, &[1]);
+        notified(slot, 1);
+        let first_notified = now();
+        pause();
+        let second = stream_released(slot, 3, 1, 1);
+        notified(slot, 3);
+        notified(slot, 4);
+        pause();
+        let insert_start = now();
+        data_set_published(slot, 0..32, insert_start, now());
+        fetched(slot, &[0..32], true);
+        pause();
+        let late = stream_released(slot, 4, 1, 2);
+        entry_batch(slot, 32, 0, 7);
+        pause();
+        notified(slot, 6);
+        stream_set_done(slot, 32, &[(first, 3), (second, 1), (late, 2)], 1);
+        {
+            let record = record(slot).unwrap();
+            let (_, set) = record.set_by_end(32).unwrap();
+            assert_eq!(set.get(Stamp::Scheduled), late);
+            assert!(CURRENT_SET.get().is_some());
+            scheduled(slot);
+            assert!(set.get(Stamp::Scheduled) > late);
+            stream_set_done(slot, 32, &[], 0);
+            assert!(CURRENT_SET.get().is_none());
+            assert!(set.get(Stamp::FirstNotify) <= first_notified);
+            assert!(set.get(Stamp::FirstNotify) >= first);
+            assert!(set.get(Stamp::FirstCommit) <= first_notified);
+            assert!(set.get(Stamp::LastNotify) >= set.get(Stamp::InsertDone));
+            assert!(set.delta_us(Stamp::Recv, Stamp::FirstNotify).is_none());
+            assert!(
+                set.delta_us(Stamp::InsertDone, Stamp::FirstNotify).unwrap() <= -600
+            );
+            assert_eq!(record.stream_tx_end.load(Relaxed), 0);
+        }
+        stream_count(slot, StreamCount::StopTick, 1);
+        data_set_completed(slot, 32..64, insert_start, now());
+        consumed(slot, 64, now());
+        fetched(slot, &[32..64], false);
+        entry_batch(slot, 64, 7, 1);
+
+        let fields = build_report(record(slot).unwrap(), slot);
+        let field = |name: &str| field(&fields, name);
+        assert_eq!(field("sets_streamed"), 1);
+        assert_eq!(field("stream_chunks"), 3);
+        assert_eq!(field("stream_chunks_pulled"), 1);
+        assert_eq!(field("stream_shreds"), 20);
+        assert_eq!(field("entries_streamed"), 4);
+        assert_eq!(field("txs_streamed"), 6);
+        assert_eq!(field("stream_stop_tick"), 1);
+        assert_eq!(field("stream_stop_marker"), 0);
+        assert_eq!(field("stream_mismatch"), 0);
+        assert_eq!(field("txs_streamed_late"), 2);
+        assert!(field("stream_lead_max_us") >= 600);
+        assert!(field("stream_lead_p50_us") >= 300);
+        assert!(field("stream_lead_min_us") <= -300);
+        let mean = field("stream_lead_mean_us");
+        assert!(mean > 0 && mean < field("stream_lead_max_us"));
+        assert_eq!(field("txs"), 8);
     }
 
     fn field(fields: &[(&'static str, i64)], name: &str) -> i64 {

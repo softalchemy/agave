@@ -62,6 +62,40 @@ pub fn replay_entries_fast_path() -> bool {
     *REPLAY_ENTRIES_FAST_PATH
 }
 
+static REPLAY_STREAMING: LazyLock<bool> = LazyLock::new(|| {
+    requires(
+        "AGAVE_REPLAY_STREAMING",
+        "AGAVE_REPLAY_ENTRIES_FAST_PATH",
+        *REPLAY_ENTRIES_FAST_PATH,
+    )
+});
+static REPLAY_STREAMING_TEST_SPLIT: LazyLock<usize> =
+    LazyLock::new(|| number("AGAVE_REPLAY_STREAMING_TEST_SPLIT") as usize);
+static REPLAY_STREAMING_TEST_DELAY_US: LazyLock<u64> =
+    LazyLock::new(|| number("AGAVE_REPLAY_STREAMING_TEST_DELAY_US"));
+static REPLAY_STREAMING_TEST_DROP: LazyLock<Option<u32>> = LazyLock::new(|| {
+    std::env::var("AGAVE_REPLAY_STREAMING_TEST_DROP")
+        .ok()
+        .and_then(|value| value.parse().ok())
+});
+
+pub fn replay_streaming() -> bool {
+    *REPLAY_STREAMING
+}
+
+pub fn replay_streaming_test_split() -> usize {
+    *REPLAY_STREAMING_TEST_SPLIT
+}
+
+pub fn replay_streaming_test_delay() -> Option<Duration> {
+    (*REPLAY_STREAMING_TEST_DELAY_US > 0)
+        .then(|| Duration::from_micros(*REPLAY_STREAMING_TEST_DELAY_US))
+}
+
+pub fn replay_streaming_test_drop() -> Option<u32> {
+    *REPLAY_STREAMING_TEST_DROP
+}
+
 pub fn geyser_tx_notify_before_commit() -> bool {
     *GEYSER_TX_NOTIFY_BEFORE_COMMIT
 }
@@ -308,7 +342,7 @@ pub fn log_flags() {
     );
     info!(
         "qn exec flags: geyser_tx_notify_before_commit={} replay_account_prefetch={} \
-         replay_account_prefetch_threads={} replay_entries_fast_path={}",
+         replay_account_prefetch_threads={} replay_entries_fast_path={} replay_streaming={}",
         geyser_tx_notify_before_commit(),
         replay_account_prefetch(),
         if replay_account_prefetch() {
@@ -317,5 +351,14 @@ pub fn log_flags() {
             0
         },
         replay_entries_fast_path(),
+        replay_streaming(),
     );
+    if replay_streaming_test_split() > 0 {
+        warn!(
+            "qn TEST HOOK active: replay_streaming_test_split={} delay_us={} drop={:?}",
+            replay_streaming_test_split(),
+            *REPLAY_STREAMING_TEST_DELAY_US,
+            replay_streaming_test_drop(),
+        );
+    }
 }

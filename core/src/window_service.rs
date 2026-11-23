@@ -212,15 +212,45 @@ where
     });
     ws_metrics.handle_packets_elapsed_us += now.elapsed().as_micros() as u64;
     ws_metrics.num_shreds_received += shreds.len();
-    let completed_data_sets = blockstore.insert_shreds_at_location_handle_duplicate(
-        shreds,
-        false, // is_trusted
-        shred_recovery_context,
-        pinnable_slice,
-        write_batch,
-        &handle_duplicate,
-        metrics,
-    )?;
+    let test_split = solana_runtime::qn_flags::replay_streaming_test_split();
+    let completed_data_sets = if test_split == 0 {
+        blockstore.insert_shreds_at_location_handle_duplicate(
+            shreds,
+            false, // is_trusted
+            shred_recovery_context,
+            pinnable_slice,
+            write_batch,
+            &handle_duplicate,
+            metrics,
+        )?
+    } else {
+        let mut shreds = shreds;
+        if let Some(drop) = solana_runtime::qn_flags::replay_streaming_test_drop() {
+            shreds.retain(|(shred, repair, _)| {
+                *repair || !shred.is_data() || shred.index() % 32 != drop
+            });
+        }
+        let mut completed_data_sets = vec![];
+        while !shreds.is_empty() {
+            let rest = shreds.split_off(test_split.min(shreds.len()));
+            completed_data_sets.extend(blockstore.insert_shreds_at_location_handle_duplicate(
+                shreds,
+                false, // is_trusted
+                shred_recovery_context,
+                pinnable_slice,
+                write_batch,
+                &handle_duplicate,
+                metrics,
+            )?);
+            shreds = rest;
+            if !shreds.is_empty()
+                && let Some(delay) = solana_runtime::qn_flags::replay_streaming_test_delay()
+            {
+                std::thread::sleep(delay);
+            }
+        }
+        completed_data_sets
+    };
 
     if let Some(sender) = completed_data_sets_sender {
         sender.try_send(completed_data_sets)?;

@@ -481,9 +481,23 @@ struct FastComponent {
     payload: Vec<u8>,
 }
 
+struct StreamChunk {
+    slot: Slot,
+    set_start: u32,
+    range: Range<u32>,
+    data: Vec<u8>,
+}
+
+pub struct StreamData {
+    pub range: Range<u32>,
+    pub data: Vec<u8>,
+    pub pulled: bool,
+}
+
 #[derive(Default)]
 struct FastPath {
     published: Vec<FastComponent>,
+    stream: Vec<StreamChunk>,
     dead_in_batch: Vec<Slot>,
 }
 
@@ -493,6 +507,7 @@ impl Drop for FastPublishGuard<'_> {
     fn drop(&mut self) {
         if let Ok(mut fast_path) = self.0.lock() {
             fast_path.published.clear();
+            fast_path.stream.clear();
         }
     }
 }
@@ -2195,13 +2210,16 @@ impl Blockstore {
     fn publish_fast_components(
         &self,
         shred_insertion_tracker: &ShredInsertionTracker,
-    ) -> Vec<(Slot, Range<u32>)> {
+    ) -> (Vec<(Slot, Range<u32>)>, bool) {
+        let streaming = solana_runtime::qn_flags::replay_streaming();
         let mut fast_path = self.fast_path.lock().unwrap();
         let FastPath {
             published,
+            stream,
             dead_in_batch,
         } = &mut *fast_path;
         published.clear();
+        stream.clear();
         let mut ranges = vec![];
         for ((location, slot), entry) in &shred_insertion_tracker.slot_meta_working_set {
             if !matches!(location, BlockLocation::Original) || !entry.did_insert_occur {
@@ -2216,13 +2234,14 @@ impl Blockstore {
                 .old_slot_meta
                 .as_ref()
                 .map_or(0, |old_slot_meta| old_slot_meta.consumed.min(meta.consumed) as u32);
-            let (completed_ranges, _) = Self::fast_path_ranges(
+            let (completed_ranges, set_start) = Self::fast_path_ranges(
                 &meta.completed_data_indexes,
                 old_consumed,
                 consumed,
                 meta.last_index,
             );
-            if completed_ranges.is_empty()
+            let stream_range = Self::stream_range(streaming, old_consumed, consumed, set_start);
+            if (completed_ranges.is_empty() && stream_range.is_none())
                 || !meta.is_parent_connected()
                 || dead_in_batch.contains(&slot)
                 || self.is_dead(slot)
@@ -2244,9 +2263,100 @@ impl Blockstore {
                 });
                 ranges.push((slot, range));
             }
+            if let Some(range) = stream_range
+                && let Some(data) = self.stream_payload(
+                    slot,
+                    range.clone(),
+                    &shred_insertion_tracker.just_inserted_shreds,
+                )
+            {
+                stream.push(StreamChunk {
+                    slot,
+                    set_start,
+                    range,
+                    data,
+                });
+            }
         }
         dead_in_batch.clear();
-        ranges
+        (ranges, !stream.is_empty())
+    }
+
+    fn stream_range(
+        streaming: bool,
+        old_consumed: u32,
+        consumed: u32,
+        set_start: u32,
+    ) -> Option<Range<u32>> {
+        let start = old_consumed.max(set_start);
+        (streaming && start < consumed).then_some(start..consumed)
+    }
+
+    fn stream_payload(
+        &self,
+        slot: Slot,
+        range: Range<u32>,
+        just_inserted_shreds: &HashMap<(BlockLocation, ShredId), Cow<'_, Shred>>,
+    ) -> Option<Vec<u8>> {
+        let mut data = vec![];
+        for payload in self.fast_path_shreds(slot, range, just_inserted_shreds)? {
+            let payload: &[u8] = payload.as_ref();
+            let flags = shred::layout::get_flags(payload).ok()?;
+            if flags.contains(ShredFlags::DATA_COMPLETE_SHRED) {
+                return None;
+            }
+            data.extend_from_slice(shred::layout::get_data(payload).ok()?);
+        }
+        Some(data)
+    }
+
+    pub fn take_stream_data(
+        &self,
+        slot: Slot,
+        set_start: u64,
+        next_index: u64,
+    ) -> Option<StreamData> {
+        let taken = {
+            let mut fast_path = self.fast_path.lock().unwrap();
+            fast_path
+                .stream
+                .iter()
+                .position(|chunk| {
+                    chunk.slot == slot
+                        && u64::from(chunk.set_start) == set_start
+                        && u64::from(chunk.range.start) == next_index
+                })
+                .map(|position| fast_path.stream.swap_remove(position))
+        };
+        let data = match taken {
+            Some(chunk) => StreamData {
+                range: chunk.range,
+                data: chunk.data,
+                pulled: false,
+            },
+            None => self.pull_stream_data(slot, set_start, next_index)?,
+        };
+        (!self.is_dead(slot)).then_some(data)
+    }
+
+    fn pull_stream_data(&self, slot: Slot, set_start: u64, next_index: u64) -> Option<StreamData> {
+        let meta = self.meta_cf.get(slot).ok()??;
+        let consumed = u32::try_from(meta.consumed).ok()?;
+        let next_index = u32::try_from(next_index).ok()?;
+        let boundary = meta
+            .completed_data_indexes
+            .previous_completed_index(consumed)
+            .map_or(0, |index| index + 1);
+        if u64::from(boundary) != set_start || next_index < boundary || next_index >= consumed {
+            return None;
+        }
+        let range = next_index..consumed;
+        let data = self.stream_payload(slot, range.clone(), &HashMap::new())?;
+        Some(StreamData {
+            range,
+            data,
+            pulled: true,
+        })
     }
 
     fn fast_path_payload(
@@ -2255,6 +2365,15 @@ impl Blockstore {
         range: Range<u32>,
         just_inserted_shreds: &HashMap<(BlockLocation, ShredId), Cow<'_, Shred>>,
     ) -> Option<Vec<u8>> {
+        Shredder::deshred(self.fast_path_shreds(slot, range, just_inserted_shreds)?).ok()
+    }
+
+    fn fast_path_shreds(
+        &self,
+        slot: Slot,
+        range: Range<u32>,
+        just_inserted_shreds: &HashMap<(BlockLocation, ShredId), Cow<'_, Shred>>,
+    ) -> Option<Vec<shred::Payload>> {
         let mut payloads: Vec<Option<shred::Payload>> = range
             .clone()
             .map(|index| {
@@ -2284,8 +2403,7 @@ impl Blockstore {
                 payloads[*position] = Some(shred::Payload::from(stored.ok()??.as_ref().to_vec()));
             }
         }
-        let payloads: Vec<shred::Payload> = payloads.into_iter().collect::<Option<_>>()?;
-        Shredder::deshred(payloads).ok()
+        payloads.into_iter().collect()
     }
 
     fn fast_path_ranges(
@@ -2536,14 +2654,15 @@ impl Blockstore {
             );
         }
         solana_runtime::shred_to_tx_timing::insert_mark(InsertPart::Recovery);
-        let fast_published = if receiving && solana_runtime::qn_flags::replay_entries_fast_path() {
-            self.publish_fast_components(&shred_insertion_tracker)
-        } else {
-            vec![]
-        };
-        let fast_publish_guard =
-            (!fast_published.is_empty()).then(|| FastPublishGuard(&self.fast_path));
-        if !fast_published.is_empty() {
+        let (fast_published, stream_published) =
+            if receiving && solana_runtime::qn_flags::replay_entries_fast_path() {
+                self.publish_fast_components(&shred_insertion_tracker)
+            } else {
+                (vec![], false)
+            };
+        let fast_publish_guard = (!fast_published.is_empty() || stream_published)
+            .then(|| FastPublishGuard(&self.fast_path));
+        if !fast_published.is_empty() || stream_published {
             if shred_to_tx_insert_start != 0 {
                 let published = solana_runtime::shred_to_tx_timing::now();
                 for (slot, range) in &fast_published {

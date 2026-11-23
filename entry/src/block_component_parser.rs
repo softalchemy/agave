@@ -9,7 +9,7 @@ use {
     bytes::Bytes,
     solana_hash::Hash,
     solana_transaction::versioned::VersionedTransaction,
-    std::mem::size_of,
+    std::mem::{self, size_of},
     wincode::{SchemaRead, config::DefaultConfig, io::Reader},
 };
 
@@ -18,9 +18,7 @@ use {
 pub fn parse<B: Into<Bytes>>(bytes: B) -> Result<ParsedBlockComponent, ParseError> {
     let bytes: Bytes = bytes.into();
 
-    let mut header: &[u8] = bytes.as_ref();
-    let entry_count =
-        <u64 as SchemaRead<DefaultConfig>>::get(header.by_ref()).map_err(ParseError::EntryCount)?;
+    let entry_count = read_entry_count(bytes.as_ref())?;
 
     // entry count of zero encodes a block marker
     let entry_count_encodes_block_marker = entry_count == 0;
@@ -29,6 +27,26 @@ pub fn parse<B: Into<Bytes>>(bytes: B) -> Result<ParsedBlockComponent, ParseErro
         let marker = wincode::deserialize::<VersionedBlockMarker>(remaining)
             .map_err(ParseError::BlockMarker)?;
         return Ok(ParsedBlockComponent::BlockMarker(marker));
+    }
+
+    // Safe to pre-allocate: entry_count already passed the preallocation-size check above.
+    let mut entry_views = Vec::with_capacity(entry_count);
+    let mut offset = BlockComponent::ENTRY_COUNT_SIZE;
+
+    for entry_index in 0..entry_count {
+        entry_views.push(parse_entry(&bytes, &mut offset, entry_index)?);
+    }
+
+    // Trailing bytes after the last entry are intentionally ignored, matching
+    // legacy `wincode::deserialize` behavior.
+    Ok(ParsedBlockComponent::EntryBatch(entry_views))
+}
+
+fn read_entry_count(mut header: &[u8]) -> Result<usize, ParseError> {
+    let entry_count =
+        <u64 as SchemaRead<DefaultConfig>>::get(header.by_ref()).map_err(ParseError::EntryCount)?;
+    if entry_count == 0 {
+        return Ok(0);
     }
 
     let entry_count = usize::try_from(entry_count)
@@ -50,83 +68,170 @@ pub fn parse<B: Into<Bytes>>(bytes: B) -> Result<ParsedBlockComponent, ParseErro
             limit: MAX_DATA_SHREDS_SIZE,
         }
     })?;
+    Ok(entry_count)
+}
 
-    // Safe to pre-allocate: entry_count already passed the preallocation-size check above.
-    let mut entry_views = Vec::with_capacity(entry_count);
-    let mut offset = BlockComponent::ENTRY_COUNT_SIZE;
+fn parse_entry(
+    bytes: &Bytes,
+    offset: &mut usize,
+    entry_index: usize,
+) -> Result<EntryView<Bytes>, ParseError> {
+    let mut cursor: &[u8] = &bytes[*offset..];
 
-    for entry_index in 0..entry_count {
-        let mut cursor: &[u8] = &bytes[offset..];
-
-        let num_hashes =
-            <u64 as SchemaRead<DefaultConfig>>::get(cursor.by_ref()).map_err(|source| {
-                ParseError::EntryHeader {
-                    entry_index,
-                    field: "num_hashes",
-                    source,
-                }
-            })?;
-        let hash = <Hash as SchemaRead<DefaultConfig>>::get(cursor.by_ref()).map_err(|source| {
+    let num_hashes =
+        <u64 as SchemaRead<DefaultConfig>>::get(cursor.by_ref()).map_err(|source| {
             ParseError::EntryHeader {
                 entry_index,
-                field: "hash",
+                field: "num_hashes",
                 source,
             }
         })?;
-        let tx_count =
-            <u64 as SchemaRead<DefaultConfig>>::get(cursor.by_ref()).map_err(|source| {
-                ParseError::EntryHeader {
-                    entry_index,
-                    field: "tx_count",
-                    source,
-                }
-            })?;
-
-        offset = bytes.len() - cursor.len();
-
-        let tx_count =
-            usize::try_from(tx_count).map_err(|_| ParseError::TransactionCountOverflow {
-                entry_index,
-                count: tx_count,
-            })?;
-        // Since the bytes are wincode serialization of [`BlockComponent::EntryBatch`] whose
-        // entries contain regular [`VersionedTransaction`]s, bound by VersionedTransaction's
-        // size to match wincode's prealloc check behavior for deserialization.
-        check_prealloc_limit::<VersionedTransaction>(tx_count).map_err(|needed| {
-            ParseError::TransactionCountPreallocLimit {
-                entry_index,
-                count: tx_count,
-                needed,
-                limit: MAX_DATA_SHREDS_SIZE,
-            }
-        })?;
-
-        // Safe to pre-allocate: tx_count already passed the preallocation-size check above.
-        let mut transactions = Vec::with_capacity(tx_count);
-
-        for tx_index in 0..tx_count {
-            let remaining_bytes = bytes.slice(offset..);
-            let (view, consumed_len) =
-                UnsanitizedTransactionView::try_new_unsanitized_from_prefix(remaining_bytes)
-                    .map_err(|error| ParseError::Transaction {
-                        entry_index,
-                        tx_index,
-                        error,
-                    })?;
-            offset += consumed_len;
-            transactions.push(view);
+    let hash = <Hash as SchemaRead<DefaultConfig>>::get(cursor.by_ref()).map_err(|source| {
+        ParseError::EntryHeader {
+            entry_index,
+            field: "hash",
+            source,
         }
+    })?;
+    let tx_count = <u64 as SchemaRead<DefaultConfig>>::get(cursor.by_ref()).map_err(|source| {
+        ParseError::EntryHeader {
+            entry_index,
+            field: "tx_count",
+            source,
+        }
+    })?;
 
-        entry_views.push(EntryView {
-            num_hashes,
-            hash,
-            transactions,
-        });
+    let mut position = bytes.len() - cursor.len();
+
+    let tx_count = usize::try_from(tx_count).map_err(|_| ParseError::TransactionCountOverflow {
+        entry_index,
+        count: tx_count,
+    })?;
+    // Since the bytes are wincode serialization of [`BlockComponent::EntryBatch`] whose
+    // entries contain regular [`VersionedTransaction`]s, bound by VersionedTransaction's
+    // size to match wincode's prealloc check behavior for deserialization.
+    check_prealloc_limit::<VersionedTransaction>(tx_count).map_err(|needed| {
+        ParseError::TransactionCountPreallocLimit {
+            entry_index,
+            count: tx_count,
+            needed,
+            limit: MAX_DATA_SHREDS_SIZE,
+        }
+    })?;
+
+    // Safe to pre-allocate: tx_count already passed the preallocation-size check above.
+    let mut transactions = Vec::with_capacity(tx_count);
+
+    for tx_index in 0..tx_count {
+        let remaining_bytes = bytes.slice(position..);
+        let (view, consumed_len) = UnsanitizedTransactionView::try_new_unsanitized_from_prefix(
+            remaining_bytes,
+        )
+        .map_err(|error| ParseError::Transaction {
+            entry_index,
+            tx_index,
+            error,
+        })?;
+        position += consumed_len;
+        transactions.push(view);
     }
 
-    // Trailing bytes after the last entry are intentionally ignored, matching
-    // legacy `wincode::deserialize` behavior.
-    Ok(ParsedBlockComponent::EntryBatch(entry_views))
+    *offset = position;
+    Ok(EntryView {
+        num_hashes,
+        hash,
+        transactions,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryStreamStop {
+    BlockMarker,
+    EntryCount,
+    Tick,
+    Oversize,
+}
+
+#[derive(Default)]
+pub struct EntryStreamParser {
+    pending: Vec<u8>,
+    entry_count: Option<usize>,
+    entries_parsed: usize,
+    bytes_parsed: usize,
+    stop: Option<EntryStreamStop>,
+}
+
+impl EntryStreamParser {
+    pub fn push(&mut self, data: &[u8]) -> Vec<EntryView<Bytes>> {
+        if self.stop.is_some() || self.entry_count == Some(self.entries_parsed) {
+            return vec![];
+        }
+        self.pending.extend_from_slice(data);
+        let entry_count = match self.entry_count {
+            Some(entry_count) => entry_count,
+            None => {
+                if self.pending.len() < BlockComponent::ENTRY_COUNT_SIZE {
+                    return vec![];
+                }
+                let entry_count = match read_entry_count(&self.pending) {
+                    Ok(0) => return self.stopped(EntryStreamStop::BlockMarker),
+                    Ok(entry_count) => entry_count,
+                    Err(_) => return self.stopped(EntryStreamStop::EntryCount),
+                };
+                self.pending.drain(..BlockComponent::ENTRY_COUNT_SIZE);
+                self.bytes_parsed = BlockComponent::ENTRY_COUNT_SIZE;
+                self.entry_count = Some(entry_count);
+                entry_count
+            }
+        };
+        let bytes = Bytes::from(mem::take(&mut self.pending));
+        let mut offset = 0;
+        let mut entries = vec![];
+        while self.entries_parsed < entry_count {
+            let mut next_offset = offset;
+            let Ok(entry) = parse_entry(&bytes, &mut next_offset, self.entries_parsed) else {
+                break;
+            };
+            if entry.is_tick() {
+                self.stop = Some(EntryStreamStop::Tick);
+                break;
+            }
+            offset = next_offset;
+            self.entries_parsed += 1;
+            entries.push(entry);
+        }
+        self.bytes_parsed += offset;
+        if self.stop.is_none() && self.entries_parsed < entry_count {
+            if bytes.len() - offset > MAX_DATA_SHREDS_SIZE {
+                self.stop = Some(EntryStreamStop::Oversize);
+            } else {
+                self.pending = bytes[offset..].to_vec();
+            }
+        }
+        entries
+    }
+
+    fn stopped(&mut self, stop: EntryStreamStop) -> Vec<EntryView<Bytes>> {
+        self.pending = vec![];
+        self.stop = Some(stop);
+        vec![]
+    }
+
+    pub fn stop(&self) -> Option<EntryStreamStop> {
+        self.stop
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.entry_count == Some(self.entries_parsed)
+    }
+
+    pub fn entries_parsed(&self) -> usize {
+        self.entries_parsed
+    }
+
+    pub fn bytes_parsed(&self) -> usize {
+        self.bytes_parsed
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -253,6 +358,201 @@ mod tests {
             panic!("expected EntryBatch");
         };
         views
+    }
+
+    fn stream_fixture() -> (Vec<Entry>, Vec<u8>) {
+        let entries = vec![
+            entry_with_transactions(1, vec![transfer_transaction(1)]),
+            entry_with_transactions(
+                3,
+                vec![
+                    transfer_transaction(2),
+                    transfer_transaction(3),
+                    transfer_transaction(4),
+                ],
+            ),
+            entry_with_transactions(1, vec![transfer_transaction(5), transfer_transaction(6)]),
+            entry_with_transactions(2, vec![transfer_transaction(7)]),
+        ];
+        let component = BlockComponent::new_entry_batch(entries.clone()).unwrap();
+        (entries, wincode::serialize(&component).unwrap())
+    }
+
+    fn assert_same_entries(streamed: &[EntryView<Bytes>], whole: &[EntryView<Bytes>]) {
+        assert_eq!(streamed.len(), whole.len());
+        for (streamed, whole) in streamed.iter().zip(whole) {
+            assert_eq!(streamed.num_hashes, whole.num_hashes);
+            assert_eq!(streamed.hash, whole.hash);
+            assert_eq!(streamed.transactions.len(), whole.transactions.len());
+            for (streamed, whole) in streamed.transactions.iter().zip(&whole.transactions) {
+                assert_eq!(streamed.data(), whole.data());
+                assert_eq!(streamed.signatures(), whole.signatures());
+            }
+        }
+    }
+
+    fn whole_entries(bytes: &[u8]) -> Vec<EntryView<Bytes>> {
+        let ParsedBlockComponent::EntryBatch(whole) = parse(bytes.to_vec()).unwrap() else {
+            panic!("expected EntryBatch");
+        };
+        whole
+    }
+
+    #[test]
+    fn stream_parser_split_at_every_byte_matches_whole_parse() {
+        let (source, bytes) = stream_fixture();
+        let whole = whole_entries(&bytes);
+        assert_eq!(whole.len(), source.len());
+        for split in 0..=bytes.len() {
+            let mut parser = EntryStreamParser::default();
+            let mut streamed = parser.push(&bytes[..split]);
+            let first = streamed.len();
+            assert_same_entries(&streamed, &whole[..first]);
+            streamed.extend(parser.push(&bytes[split..]));
+            assert_same_entries(&streamed, &whole);
+            assert_eq!(parser.entries_parsed(), whole.len());
+            assert!(parser.is_complete());
+            assert_eq!(parser.bytes_parsed(), bytes.len());
+            assert_eq!(parser.stop(), None);
+            assert!(parser.push(&[1, 2, 3]).is_empty());
+        }
+    }
+
+    #[test]
+    fn stream_parser_split_at_every_pair_of_bytes_matches_whole_parse() {
+        let (_, bytes) = stream_fixture();
+        let whole = whole_entries(&bytes);
+        for first in (0..=bytes.len()).step_by(7) {
+            for second in first..=bytes.len() {
+                let mut parser = EntryStreamParser::default();
+                let mut streamed = parser.push(&bytes[..first]);
+                streamed.extend(parser.push(&bytes[first..second]));
+                streamed.extend(parser.push(&bytes[second..]));
+                assert_same_entries(&streamed, &whole);
+            }
+        }
+    }
+
+    #[test]
+    fn stream_parser_byte_by_byte_releases_each_entry_at_its_last_byte() {
+        let (source, bytes) = stream_fixture();
+        let whole = whole_entries(&bytes);
+        let mut ends = vec![];
+        let mut end = BlockComponent::ENTRY_COUNT_SIZE;
+        for entry in &source {
+            end += wincode::serialize(entry).unwrap().len();
+            ends.push(end);
+        }
+        assert_eq!(end, bytes.len());
+        let mut parser = EntryStreamParser::default();
+        let mut streamed = vec![];
+        for (position, byte) in bytes.iter().enumerate() {
+            let released = parser.push(&[*byte]);
+            let expected = ends.iter().filter(|end| **end == position + 1).count();
+            assert_eq!(released.len(), expected, "byte {position}");
+            streamed.extend(released);
+            assert_eq!(
+                parser.entries_parsed(),
+                ends.iter().filter(|end| **end <= position + 1).count()
+            );
+        }
+        assert_same_entries(&streamed, &whole);
+    }
+
+    #[test]
+    fn stream_parser_ignores_trailing_bytes_and_padding() {
+        let (_, mut bytes) = stream_fixture();
+        let whole = whole_entries(&bytes);
+        bytes.extend_from_slice(&[0u8; 4096]);
+        for chunk in [1, 13, 1000, 8192] {
+            let mut parser = EntryStreamParser::default();
+            let streamed: Vec<_> = bytes
+                .chunks(chunk)
+                .flat_map(|chunk| parser.push(chunk))
+                .collect();
+            assert_same_entries(&streamed, &whole);
+            assert_eq!(parser.stop(), None);
+        }
+    }
+
+    #[test]
+    fn stream_parser_stops_at_tick_without_consuming_it() {
+        let entries = vec![
+            entry_with_transactions(1, vec![transfer_transaction(1)]),
+            entry_with_transactions(1, vec![transfer_transaction(2)]),
+            Entry::default(),
+            entry_with_transactions(1, vec![transfer_transaction(3)]),
+        ];
+        let component = BlockComponent::new_entry_batch(entries).unwrap();
+        let bytes = wincode::serialize(&component).unwrap();
+        let whole = whole_entries(&bytes);
+        for split in 0..=bytes.len() {
+            let mut parser = EntryStreamParser::default();
+            let mut streamed = parser.push(&bytes[..split]);
+            streamed.extend(parser.push(&bytes[split..]));
+            assert_same_entries(&streamed, &whole[..2]);
+            assert_eq!(parser.stop(), Some(EntryStreamStop::Tick));
+            assert_eq!(parser.entries_parsed(), 2);
+        }
+        let alpentick =
+            wincode::serialize(&BlockComponent::new_entry_batch(vec![Entry::default()]).unwrap())
+                .unwrap();
+        let mut parser = EntryStreamParser::default();
+        assert!(parser.push(&alpentick).is_empty());
+        assert_eq!(parser.stop(), Some(EntryStreamStop::Tick));
+    }
+
+    #[test]
+    fn stream_parser_never_streams_markers_or_bad_counts() {
+        let marker = wincode::serialize(&BlockComponent::new_block_marker(
+            VersionedBlockMarker::from_block_footer(sample_footer()),
+        ))
+        .unwrap();
+        for split in 0..=marker.len() {
+            let mut parser = EntryStreamParser::default();
+            assert!(parser.push(&marker[..split]).is_empty());
+            assert!(parser.push(&marker[split..]).is_empty());
+            assert_eq!(parser.stop(), Some(EntryStreamStop::BlockMarker));
+        }
+        let (_, bytes) = stream_fixture();
+        let mut too_many = (BlockComponent::MAX_ENTRIES as u64).to_le_bytes().to_vec();
+        too_many.extend_from_slice(&bytes[BlockComponent::ENTRY_COUNT_SIZE..]);
+        let mut parser = EntryStreamParser::default();
+        assert!(parser.push(&too_many).is_empty());
+        assert_eq!(parser.stop(), Some(EntryStreamStop::EntryCount));
+    }
+
+    #[test]
+    fn stream_parser_never_exceeds_the_entry_count() {
+        let (_, bytes) = stream_fixture();
+        let whole = whole_entries(&bytes);
+        let mut short_count = 2u64.to_le_bytes().to_vec();
+        short_count.extend_from_slice(&bytes[BlockComponent::ENTRY_COUNT_SIZE..]);
+        let mut parser = EntryStreamParser::default();
+        let streamed: Vec<_> = short_count
+            .chunks(5)
+            .flat_map(|chunk| parser.push(chunk))
+            .collect();
+        assert_same_entries(&streamed, &whole[..2]);
+        assert_same_entries(&streamed, &whole_entries(&short_count));
+    }
+
+    #[test]
+    fn stream_parser_waits_on_a_truncated_or_corrupt_entry() {
+        let (_, bytes) = stream_fixture();
+        let whole = whole_entries(&bytes);
+        let mut parser = EntryStreamParser::default();
+        let streamed = parser.push(&bytes[..bytes.len() - 1]);
+        assert_same_entries(&streamed, &whole[..3]);
+        assert_eq!(parser.stop(), None);
+        let mut long_count = 5u64.to_le_bytes().to_vec();
+        long_count.extend_from_slice(&bytes[BlockComponent::ENTRY_COUNT_SIZE..]);
+        assert!(parse(long_count.clone()).is_err());
+        let mut parser = EntryStreamParser::default();
+        let streamed = parser.push(&long_count);
+        assert_same_entries(&streamed, &whole);
+        assert_eq!(parser.stop(), None);
+        assert_eq!(parser.entries_parsed(), 4);
     }
 
     #[test]
