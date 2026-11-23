@@ -48,6 +48,7 @@ use {
         commitment::VOTE_THRESHOLD_SIZE,
         installed_scheduler_pool::BankWithScheduler,
         leader_schedule_utils::leader_slot_index,
+        qn_flags,
         runtime_config::RuntimeConfig,
         snapshot_controller::SnapshotController,
         transaction_execution::TransactionStatusSender,
@@ -242,6 +243,68 @@ fn process_entries(bank: &BankWithScheduler, entries: Vec<ReplayEntry>) -> Resul
         bank.register_tick(&hash);
     }
     Ok(())
+}
+
+fn schedule_entries_incrementally<F>(
+    bank: &BankWithScheduler,
+    entries: Vec<EntryView<Bytes>>,
+    entry_tx_starting_indexes: &[usize],
+    num_txs: usize,
+    verify: &F,
+) -> result::Result<(entry::UnverifiedSignatures<Bytes>, Vec<Hash>), BlockstoreProcessorError>
+where
+    F: Fn(UnsanitizedTransactionView<Bytes>) -> Result<ReplayTransaction>,
+{
+    let is_vote_only_bank = bank.vote_only_bank();
+    let mut unverified_signatures = entry::UnverifiedSignatures::with_capacity(num_txs);
+    let mut tick_hashes = vec![];
+    let mut at_block_boundary = false;
+    for (entry, &starting_index) in entries.into_iter().zip(entry_tx_starting_indexes) {
+        let entry =
+            entry::validate_and_hash_entry_transactions(entry, verify, &mut unverified_signatures)
+                .inspect_err(|_| {
+                    warn!(
+                        "Ledger transaction hash verification failed at slot: {}",
+                        bank.slot()
+                    );
+                })?;
+        match entry {
+            EntryType::Tick(hash) => {
+                if !at_block_boundary {
+                    tick_hashes.push(hash);
+                    at_block_boundary =
+                        bank.is_block_boundary(bank.tick_height() + tick_hashes.len() as u64);
+                }
+            }
+            EntryType::Transactions(transactions) => {
+                if is_vote_only_bank
+                    && transactions
+                        .iter()
+                        .any(|tx| !is_valid_vote_only_transaction(tx))
+                {
+                    return Err(BlockstoreProcessorError::UserTransactionsInVoteOnlyBank(
+                        bank.slot(),
+                    ));
+                }
+                if at_block_boundary {
+                    continue;
+                }
+                assert!(
+                    bank.has_installed_scheduler(),
+                    "no scheduler installed for bank of slot {} during replay",
+                    bank.slot()
+                );
+                validate_entry_transactions(
+                    &transactions,
+                    bank.get_transaction_account_lock_limit(),
+                )?;
+                let indexes = starting_index..starting_index + transactions.len();
+                let task_ids = indexes.map(|i| i.try_into().unwrap());
+                bank.schedule_transaction_executions(transactions.into_iter().zip_eq(task_ids))?;
+            }
+        }
+    }
+    Ok((unverified_signatures, tick_hashes))
 }
 
 /// Validate an entry's transactions before scheduling: each transaction's account
@@ -1665,6 +1728,24 @@ fn confirm_slot_entries(
         }
     };
 
+    let (entries, scheduled_incrementally) = if qn_flags::replay_schedule_per_entry()
+        && num_txs < entry::PARALLEL_VERIFY_THRESHOLD
+    {
+        let mut replay_timer = Measure::start("replay_elapsed");
+        let scheduled = schedule_entries_incrementally(
+            bank,
+            entries,
+            &entry_tx_starting_indexes,
+            num_txs,
+            &validate_and_hash_transaction,
+        );
+        replay_timer.stop();
+        *replay_elapsed += replay_timer.as_us();
+        (vec![], Some(scheduled?))
+    } else {
+        (entries, None)
+    };
+
     let entry::ValidatedHashedTransactions {
         entries,
         unverified_signatures,
@@ -1683,6 +1764,8 @@ fn confirm_slot_entries(
             return Err(err.into());
         }
     };
+    let (unverified_signatures, scheduled_tick_hashes) =
+        scheduled_incrementally.unwrap_or((unverified_signatures, vec![]));
     let bank_id = bank.bank_id();
     if skip_verification {
         if let Some(replay_vote_sender) = replay_vote_sender {
@@ -1709,6 +1792,9 @@ fn confirm_slot_entries(
     }
 
     let mut replay_timer = Measure::start("replay_elapsed");
+    for hash in scheduled_tick_hashes {
+        bank.register_tick(&hash);
+    }
     let is_vote_only_bank = bank.vote_only_bank();
     let replay_entries: Vec<_> = entries
         .into_iter()
