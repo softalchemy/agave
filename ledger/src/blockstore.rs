@@ -2315,6 +2315,7 @@ impl Blockstore {
         write_batch: &mut WriteBatch,
         metrics: &mut BlockstoreInsertionMetrics,
     ) -> Result<InsertResults> {
+        let insert_start = solana_runtime::slot_tail_timing::now_if_enabled();
         let shreds = shreds.into_iter();
         let mut shred_insertion_tracker = ShredInsertionTracker::new(shreds.len(), write_batch);
 
@@ -2359,7 +2360,7 @@ impl Blockstore {
         start.stop();
         metrics.write_batch_elapsed_us += start.as_us();
         for (slot, _) in newly_completed_slots_with_last_index.iter() {
-            solana_runtime::slot_tail_timing::full(*slot);
+            solana_runtime::slot_tail_timing::full(*slot, insert_start);
         }
 
         if let Some(forwarder) = self.certificate_forwarder.get() {

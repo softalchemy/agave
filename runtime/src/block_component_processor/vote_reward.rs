@@ -472,6 +472,7 @@ pub(super) fn calc_vote_rewards_update_vote_states(
         )?,
     };
 
+    crate::slot_tail_timing::footer_accounts(bank.slot(), updated_accounts.len());
     bank.store_accounts((bank.slot(), updated_accounts.as_slice()), None);
     Ok(())
 }

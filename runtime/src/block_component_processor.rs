@@ -6,6 +6,7 @@ use {
         },
         installed_scheduler_pool::BankWithScheduler,
         leader_schedule_utils::leader_slot_index,
+        slot_tail_timing::{self, Event},
         validated_block_finalization::{
             BlockFinalizationCertError, ValidatedBlockFinalizationCert,
         },
@@ -601,6 +602,7 @@ impl BlockComponentProcessor {
         execute_timings: &mut ExecuteTimings,
     ) -> Result<(), BlockComponentProcessorError> {
         self.stage.on_footer()?;
+        slot_tail_timing::mark(bank.slot(), Event::FooterStart);
 
         let VersionedBlockFooter::V1(footer) = footer;
 
@@ -642,11 +644,13 @@ impl BlockComponentProcessor {
             }
         };
 
+        slot_tail_timing::mark(bank.slot(), Event::FooterCertsVerified);
         // We need to wait for any in progress execution before modifying account state
         if let Some((result, execute_time)) = bank.wait_for_completed_scheduler() {
             execute_timings.accumulate(&execute_time);
             result?;
         }
+        slot_tail_timing::mark(bank.slot(), Event::FooterSchedulerWaited);
 
         Self::update_bank_with_footer_fields(
             bank,
@@ -657,6 +661,7 @@ impl BlockComponentProcessor {
                 .as_ref()
                 .map(|(validators, slot)| (validators, *slot)),
         )?;
+        slot_tail_timing::mark(bank.slot(), Event::FooterDone);
 
         // Send finalization cert(s) to consensus pool
         if let Some((finalize_cert, notarize_cert)) = pool_input

@@ -11,8 +11,8 @@ use {
 };
 
 const RECORDS_LEN: usize = 64;
-const EVENTS_LEN: usize = 17;
-const COUNTERS_LEN: usize = 3;
+const EVENTS_LEN: usize = 23;
+const COUNTERS_LEN: usize = 4;
 const BUSY: u64 = u64::MAX;
 const UNSET: i64 = i64::MIN;
 
@@ -36,11 +36,18 @@ pub enum Event {
     FrozenHandled,
     ProcessedNotifyCalled,
     ProcessedNotifyReturned,
+    InsertStart,
+    FooterStart,
+    FooterCertsVerified,
+    FooterSchedulerWaited,
+    FooterAccountsComputed,
+    FooterDone,
 }
 
 const TXS_AFTER_FULL: usize = 0;
 const ENTRIES_AFTER_FULL: usize = 1;
 const REPLAY_PASSES_AFTER_FULL: usize = 2;
+const FOOTER_ACCOUNTS: usize = 3;
 
 struct Record {
     slot: AtomicU64,
@@ -121,11 +128,30 @@ pub fn first_shred(slot: Slot) {
     }
 }
 
-pub fn full(slot: Slot) {
+pub fn now_if_enabled() -> u64 {
+    if qn_flags::slot_tail_timing() {
+        now()
+    } else {
+        0
+    }
+}
+
+pub fn full(slot: Slot, insert_start: u64) {
     if qn_flags::slot_tail_timing()
         && let Some(record) = claim(slot)
+        && record.get(Event::Full) == 0
     {
+        record.set_first(Event::InsertStart, insert_start);
         record.set_first(Event::Full, now());
+    }
+}
+
+pub fn footer_accounts(slot: Slot, num_accounts: usize) {
+    if qn_flags::slot_tail_timing()
+        && let Some(record) = record(slot)
+    {
+        record.counters[FOOTER_ACCOUNTS].store(num_accounts as u64, Relaxed);
+        record.events[Event::FooterAccountsComputed as usize].store(now(), Relaxed);
     }
 }
 
@@ -199,6 +225,29 @@ pub fn maybe_report(slot: Slot) {
         "slot_tail_timing",
         ("slot", slot as i64, i64),
         ("first_shred_us", record.relative_us(Event::FirstShred), i64),
+        ("insert_start_us", record.relative_us(Event::InsertStart), i64),
+        ("footer_start_us", record.relative_us(Event::FooterStart), i64),
+        (
+            "footer_certs_verified_us",
+            record.relative_us(Event::FooterCertsVerified),
+            i64
+        ),
+        (
+            "footer_scheduler_waited_us",
+            record.relative_us(Event::FooterSchedulerWaited),
+            i64
+        ),
+        (
+            "footer_accounts_computed_us",
+            record.relative_us(Event::FooterAccountsComputed),
+            i64
+        ),
+        ("footer_done_us", record.relative_us(Event::FooterDone), i64),
+        (
+            "footer_accounts",
+            record.counters[FOOTER_ACCOUNTS].load(Relaxed) as i64,
+            i64
+        ),
         ("replay_wakeup_us", record.relative_us(Event::ReplayWakeup), i64),
         ("entries_fetched_us", record.relative_us(Event::EntriesFetched), i64),
         (
