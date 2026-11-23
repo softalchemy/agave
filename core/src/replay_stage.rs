@@ -248,6 +248,7 @@ struct CompletedBankReplay {
     replay_progress: Arc<RwLock<ConfirmationProgress>>,
     // True when the bank completed via the unified scheduler path.
     is_unified_scheduler_enabled: bool,
+    processed_notified: bool,
 }
 
 struct ProcessActiveBanksContext {
@@ -3912,6 +3913,14 @@ impl ReplayStage {
             scheduler_replay_outcome,
             SchedulerReplayOutcome::SchedulerReplayCompleted(_)
         );
+        let processed_notified = qn_flags::geyser_processed_early()
+            && matches!(
+                scheduler_replay_outcome,
+                SchedulerReplayOutcome::SchedulerReplayCompleted(Ok(()))
+            );
+        if processed_notified {
+            Self::notify_slot_processed_inline(process_active_banks_context, bank);
+        }
         let verify_result = Self::complete_replay_verification(
             &replay_stats,
             &bank_progress.replay_progress,
@@ -3938,6 +3947,7 @@ impl ReplayStage {
             replay_stats,
             replay_progress: bank_progress.replay_progress.clone(),
             is_unified_scheduler_enabled,
+            processed_notified,
         })
     }
 
@@ -4179,7 +4189,9 @@ impl ReplayStage {
                         bank,
                         r_replay_progress.num_entries as u64,
                     );
-                    Self::notify_slot_processed_inline(process_active_banks_context, bank);
+                    if !completed_replay.processed_notified {
+                        Self::notify_slot_processed_inline(process_active_banks_context, bank);
+                    }
                 }
                 new_frozen_slots.push(bank.slot());
                 if process_active_banks_context
