@@ -373,6 +373,10 @@ impl OptimisticallyConfirmedBankTracker {
             }
             BankNotification::Frozen(bank) => {
                 let frozen_slot = bank.slot();
+                solana_runtime::slot_tail_timing::mark(
+                    frozen_slot,
+                    solana_runtime::slot_tail_timing::Event::FrozenHandled,
+                );
                 if let Some(parent) = bank.parent() {
                     let num_successful_transactions = bank
                         .transaction_count()

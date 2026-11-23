@@ -92,6 +92,7 @@ use {
         installed_scheduler_pool::BankWithScheduler,
         leader_schedule_utils::first_of_consecutive_leader_slots,
         qn_flags,
+        slot_tail_timing::{self, Event},
         snapshot_controller::SnapshotController,
         transaction_execution::TransactionStatusSender,
         vote_sender_types::{ReplayVoteMessage, ReplayVoteSender},
@@ -961,6 +962,7 @@ impl ReplayStage {
                 if exit.load(Ordering::Relaxed) {
                     break;
                 }
+                slot_tail_timing::replay_pass();
 
                 if matches!(
                     Self::process_bank_forks_commands(
@@ -3909,6 +3911,7 @@ impl ReplayStage {
         let replay_stats = bank_progress.replay_stats.clone();
 
         let scheduler_replay_outcome = Self::complete_scheduler_replay(bank, &replay_stats);
+        slot_tail_timing::mark(bank.slot(), Event::SchedulerCompleted);
         let is_unified_scheduler_enabled = matches!(
             scheduler_replay_outcome,
             SchedulerReplayOutcome::SchedulerReplayCompleted(_)
@@ -3926,6 +3929,7 @@ impl ReplayStage {
             &bank_progress.replay_progress,
             async_verification_freelist,
         );
+        slot_tail_timing::mark(bank.slot(), Event::VerificationWaitDone);
 
         // Send this whether the block was valid or not. It is only used to
         // release buffered votes, if any.
@@ -3997,7 +4001,8 @@ impl ReplayStage {
                 bank.executed_transaction_count(),
                 entry_count,
                 commission_rate_in_basis_points,
-            )
+            );
+            slot_tail_timing::mark(bank.slot(), Event::BlockMetaNotified);
         }
     }
 
@@ -4136,6 +4141,7 @@ impl ReplayStage {
                     bank.freeze();
                     Ok(())
                 };
+                slot_tail_timing::mark(bank_slot, Event::FreezeDone);
 
                 datapoint_info!(
                     "bank_frozen",
@@ -4324,6 +4330,8 @@ impl ReplayStage {
                             dependency_work,
                         ))
                         .unwrap_or_else(|err| warn!("bank_notification_sender failed: {err:?}"));
+                    slot_tail_timing::mark(bank_slot, Event::FrozenSent);
+                    slot_tail_timing::maybe_report(bank_slot);
                 }
 
                 let bank_hash = bank.hash();

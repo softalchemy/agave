@@ -31,6 +31,7 @@ mod reward_info;
 pub mod runtime_config;
 pub mod serde_snapshot;
 pub mod slot_params;
+pub mod slot_tail_timing;
 pub mod snapshot_bank_utils;
 pub mod snapshot_controller;
 pub mod snapshot_minimizer;

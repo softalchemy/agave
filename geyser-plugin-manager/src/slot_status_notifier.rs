@@ -5,6 +5,7 @@ use {
     log::*,
     solana_clock::{BankId, Slot},
     solana_rpc::slot_status_notifier::SlotStatusNotifierInterface,
+    solana_runtime::slot_tail_timing::{self, Event},
     std::sync::Arc,
 };
 
@@ -18,7 +19,10 @@ impl SlotStatusNotifierInterface for SlotStatusNotifierImpl {
     }
 
     fn notify_slot_processed(&self, slot: Slot, parent: Option<Slot>, bank_id: BankId) {
+        slot_tail_timing::mark(slot, Event::ProcessedNotifyCalled);
         self.notify_bank_status(slot, parent, SlotStatus::Processed, bank_id);
+        slot_tail_timing::mark(slot, Event::ProcessedNotifyReturned);
+        slot_tail_timing::maybe_report(slot);
     }
 
     fn notify_slot_rooted(&self, slot: Slot, parent: Option<Slot>, bank_id: BankId) {

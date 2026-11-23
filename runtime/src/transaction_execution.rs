@@ -3,6 +3,7 @@ use {
         bank::{Bank, TransactionBalancesSet},
         bank_utils,
         dependency_tracker::DependencyTracker,
+        slot_tail_timing,
         prioritization_fee_cache::PrioritizationFeeCache,
         transaction_balances::compile_collected_balances,
         transaction_batch::TransactionBatch,
@@ -92,6 +93,7 @@ pub fn execute_batch<'a>(
             log_messages_bytes_limit,
             pre_commit_callback,
         )?;
+    slot_tail_timing::tx_committed(bank.slot());
 
     let mut check_block_costs_elapsed = Measure::start("check_block_costs");
 

@@ -30,6 +30,7 @@ static GEYSER_PROCESSED_EARLY: LazyLock<bool> = LazyLock::new(|| {
 });
 static REPLAY_SCHEDULE_PER_ENTRY: LazyLock<bool> =
     LazyLock::new(|| enabled("AGAVE_REPLAY_SCHEDULE_PER_ENTRY"));
+static SLOT_TAIL_TIMING: LazyLock<bool> = LazyLock::new(|| enabled("AGAVE_SLOT_TAIL_TIMING"));
 
 pub fn geyser_tx_notify_inline() -> bool {
     *GEYSER_TX_NOTIFY_INLINE
@@ -47,13 +48,18 @@ pub fn replay_schedule_per_entry() -> bool {
     *REPLAY_SCHEDULE_PER_ENTRY
 }
 
+pub fn slot_tail_timing() -> bool {
+    *SLOT_TAIL_TIMING
+}
+
 pub fn log_flags() {
     info!(
         "qn flags: geyser_tx_notify_inline={} geyser_processed_inline={} \
-         geyser_processed_early={} replay_schedule_per_entry={}",
+         geyser_processed_early={} replay_schedule_per_entry={} slot_tail_timing={}",
         geyser_tx_notify_inline(),
         geyser_processed_inline(),
         geyser_processed_early(),
         replay_schedule_per_entry(),
+        slot_tail_timing(),
     );
 }

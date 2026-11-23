@@ -13,6 +13,7 @@ use {
         bank::{Bank, KeyedRewardsAndNumPartitions},
         dependency_tracker::DependencyTracker,
         qn_flags,
+        slot_tail_timing::{self, Event},
         transaction_execution::{
             INLINE_TRANSACTION_STATUS_HANDLER, TransactionStatusBatch, TransactionStatusMessage,
         },
@@ -290,6 +291,7 @@ impl TransactionStatusService {
                             &transaction_status_meta,
                             &transaction,
                         );
+                        slot_tail_timing::mark_max(slot, Event::LastTxGeyserNotified);
                     }
 
                     if !(enable_extended_tx_metadata_storage || transaction_notifier.is_some()) {

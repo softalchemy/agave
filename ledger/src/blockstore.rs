@@ -2358,6 +2358,9 @@ impl Blockstore {
         self.write_batch(&mut *shred_insertion_tracker.write_batch)?;
         start.stop();
         metrics.write_batch_elapsed_us += start.as_us();
+        for (slot, _) in newly_completed_slots_with_last_index.iter() {
+            solana_runtime::slot_tail_timing::full(*slot);
+        }
 
         if let Some(forwarder) = self.certificate_forwarder.get() {
             for (slot, last_index) in newly_completed_slots_with_last_index.iter() {
@@ -3623,6 +3626,7 @@ impl Blockstore {
     ) -> impl Iterator<Item = CompletedDataSetInfo> + 'a + use<'a> {
         let slot = shred.slot();
         let index = u64::from(shred.index());
+        solana_runtime::slot_tail_timing::first_shred(slot);
 
         let last_in_slot = if shred.last_in_slot() {
             debug!("got last in slot");

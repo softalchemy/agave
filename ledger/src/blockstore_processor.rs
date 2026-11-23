@@ -50,6 +50,7 @@ use {
         leader_schedule_utils::leader_slot_index,
         qn_flags,
         runtime_config::RuntimeConfig,
+        slot_tail_timing::{self, Event},
         snapshot_controller::SnapshotController,
         transaction_execution::TransactionStatusSender,
         vote_sender_types::{ReplayVoteMessage, ReplayVoteSender},
@@ -203,6 +204,7 @@ fn schedule_entries_for_tests(bank: &BankWithScheduler, entries: Vec<Entry>) -> 
 
 fn process_entries(bank: &BankWithScheduler, entries: Vec<ReplayEntry>) -> Result<()> {
     let mut tick_hashes = vec![];
+    let has_entries = !entries.is_empty();
 
     for ReplayEntry {
         entry,
@@ -238,6 +240,9 @@ fn process_entries(bank: &BankWithScheduler, entries: Vec<ReplayEntry>) -> Resul
                 bank.schedule_transaction_executions(transactions.into_iter().zip_eq(task_ids))?;
             }
         }
+    }
+    if has_entries {
+        slot_tail_timing::mark(bank.slot(), Event::LastEntryScheduled);
     }
     for hash in tick_hashes {
         bank.register_tick(&hash);
@@ -1481,6 +1486,7 @@ pub fn confirm_slot(
         }
         load_result
     }?;
+    slot_tail_timing::mark(slot, Event::EntriesFetched);
 
     // Process block components for Alpenglow slots. Note that we don't need to run migration checks
     // for BlockMarkers here, despite BlockMarkers only being active post-Alpenglow. Here's why:
@@ -1646,6 +1652,7 @@ fn confirm_slot_entries(
         bank.set_accounts_lt_hash_async_progress_is_at_end();
     }
     let num_entries = entries.len();
+    slot_tail_timing::entries(slot, num_entries);
     let mut entry_tx_starting_indexes = Vec::with_capacity(num_entries);
     let mut entry_tx_starting_index = progress.num_txs;
     let num_txs = entries
@@ -1741,6 +1748,7 @@ fn confirm_slot_entries(
         );
         replay_timer.stop();
         *replay_elapsed += replay_timer.as_us();
+        slot_tail_timing::mark(slot, Event::LastEntryScheduled);
         (vec![], Some(scheduled?))
     } else {
         (entries, None)
@@ -1826,6 +1834,7 @@ fn confirm_slot_entries(
 
     let process_result =
         process_entries(bank, replay_entries).map_err(BlockstoreProcessorError::from);
+    slot_tail_timing::mark(slot, Event::SchedulerDrained);
     replay_timer.stop();
     *replay_elapsed += replay_timer.as_us();
 
