@@ -38,6 +38,35 @@ static REPLAY_POH_SPAWN_AFTER_SCHEDULE: LazyLock<bool> =
 static REPLAY_TX_VERIFY_PARALLEL_MIN: LazyLock<usize> =
     LazyLock::new(|| number("AGAVE_REPLAY_TX_VERIFY_PARALLEL_MIN") as usize);
 
+static GEYSER_TX_NOTIFY_BEFORE_COMMIT: LazyLock<bool> =
+    LazyLock::new(|| enabled("AGAVE_GEYSER_TX_NOTIFY_BEFORE_COMMIT"));
+static REPLAY_ACCOUNT_PREFETCH: LazyLock<bool> =
+    LazyLock::new(|| enabled("AGAVE_REPLAY_ACCOUNT_PREFETCH"));
+static ACCOUNT_PREFETCH_POOL: LazyLock<ThreadPool> = LazyLock::new(|| {
+    let num_threads = std::env::var("AGAVE_REPLAY_ACCOUNT_PREFETCH_THREADS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|num_threads| *num_threads > 0)
+        .unwrap_or(4);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .thread_name(|i| format!("solAcctPref{i:02}"))
+        .build()
+        .unwrap()
+});
+
+pub fn geyser_tx_notify_before_commit() -> bool {
+    *GEYSER_TX_NOTIFY_BEFORE_COMMIT
+}
+
+pub fn replay_account_prefetch() -> bool {
+    *REPLAY_ACCOUNT_PREFETCH
+}
+
+pub fn account_prefetch_pool() -> &'static ThreadPool {
+    &ACCOUNT_PREFETCH_POOL
+}
+
 pub fn sched_finish_before_notify() -> bool {
     *SCHED_FINISH_BEFORE_NOTIFY
 }
@@ -269,5 +298,16 @@ pub fn log_flags() {
         *SCHED_SPIN_US,
         replay_poh_spawn_after_schedule(),
         replay_tx_verify_parallel_min(),
+    );
+    info!(
+        "qn exec flags: geyser_tx_notify_before_commit={} replay_account_prefetch={} \
+         replay_account_prefetch_threads={}",
+        geyser_tx_notify_before_commit(),
+        replay_account_prefetch(),
+        if replay_account_prefetch() {
+            account_prefetch_pool().current_num_threads()
+        } else {
+            0
+        },
     );
 }

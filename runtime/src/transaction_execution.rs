@@ -3,10 +3,11 @@ use {
         bank::{Bank, TransactionBalancesSet},
         bank_utils,
         dependency_tracker::DependencyTracker,
-        slot_tail_timing,
         prioritization_fee_cache::PrioritizationFeeCache,
+        qn_flags, slot_tail_timing,
         transaction_balances::compile_collected_balances,
         transaction_batch::TransactionBatch,
+        tx_exec_timing::{self, Part},
         vote_sender_types::{ReplayVoteSendType, ReplayVoteSender},
     },
     log::{trace, warn},
@@ -20,6 +21,7 @@ use {
         transaction_commit_result::{
             TransactionCommitResult, TransactionCommitResultExtensions as _,
         },
+        transaction_processing_result::TransactionProcessingResult,
         transaction_processor::ExecutionRecordingConfig,
     },
     solana_svm_timings::{ExecuteTimingType, ExecuteTimings},
@@ -66,6 +68,78 @@ pub struct BatchPostCommit {
     balance_collector: Option<BalanceCollector>,
     costs: Vec<Option<u64>>,
     transaction_indexes: Vec<usize>,
+    status_sent: bool,
+}
+
+const SVM_TIMINGS: [ExecuteTimingType; 9] = [
+    ExecuteTimingType::CheckUs,
+    ExecuteTimingType::ValidateFeesUs,
+    ExecuteTimingType::LoadUs,
+    ExecuteTimingType::CollectBalancesUs,
+    ExecuteTimingType::FilterExecutableUs,
+    ExecuteTimingType::ProgramCacheUs,
+    ExecuteTimingType::ExecuteUs,
+    ExecuteTimingType::UpdateStakesCacheUs,
+    ExecuteTimingType::UpdateTransactionStatuses,
+];
+
+fn svm_timings(timings: &ExecuteTimings) -> [u64; 9] {
+    SVM_TIMINGS.map(|kind| timings.metrics[kind].0)
+}
+
+fn record_svm_parts(before: [u64; 9], timings: &ExecuteTimings) {
+    let after = svm_timings(timings);
+    let elapsed = |index: usize| after[index].saturating_sub(before[index]) * 1_000;
+    let program_cache = elapsed(4) + elapsed(5);
+    tx_exec_timing::part_add_ns(Part::Check, elapsed(0));
+    tx_exec_timing::part_add_ns(Part::FeePayer, elapsed(1));
+    tx_exec_timing::part_add_ns(Part::Load, elapsed(2));
+    tx_exec_timing::part_add_ns(Part::Balances, elapsed(3));
+    tx_exec_timing::part_add_ns(Part::ProgramCache, program_cache);
+    tx_exec_timing::part_add_ns(Part::Execute, elapsed(6).saturating_sub(program_cache));
+    tx_exec_timing::part_add_ns(Part::StakesCache, elapsed(7));
+    tx_exec_timing::part_add_ns(Part::StatusCache, elapsed(8));
+}
+
+fn status_costs(tx_costs: Vec<Option<TransactionCost>>) -> Vec<Option<u64>> {
+    tx_costs
+        .into_iter()
+        .map(|tx_cost_option| tx_cost_option.map(|tx_cost| tx_cost.sum()).or(Some(0)))
+        .collect()
+}
+
+fn send_transaction_status(
+    transactions: &[impl TransactionWithMeta],
+    bank: &Arc<Bank>,
+    transaction_status_sender: &TransactionStatusSender,
+    commit_results: Vec<TransactionCommitResult>,
+    balance_collector: Option<BalanceCollector>,
+    costs: Vec<Option<u64>>,
+    transaction_indexes: Vec<usize>,
+    timing_start: u64,
+) {
+    let transactions: Vec<SanitizedTransaction> = transactions
+        .iter()
+        .map(|tx| tx.as_sanitized_transaction().into_owned())
+        .collect();
+
+    debug_assert!(balance_collector.is_some());
+
+    let (balances, token_balances) =
+        compile_collected_balances(balance_collector.unwrap_or_default());
+    let timing_start = tx_exec_timing::part_add(Part::StatusBuild, timing_start);
+
+    transaction_status_sender.send_transaction_status_batch(
+        bank.slot(),
+        bank.bank_id(),
+        transactions,
+        commit_results,
+        balances,
+        token_balances,
+        costs,
+        transaction_indexes,
+    );
+    tx_exec_timing::part_add(Part::Notify, timing_start);
 }
 
 pub fn execute_batch<'a>(
@@ -81,7 +155,7 @@ pub fn execute_batch<'a>(
     let post_commit = execute_batch_until_commit(
         batch,
         bank,
-        transaction_status_sender.is_some(),
+        transaction_status_sender,
         replay_vote_sender,
         replay_vote_send_type,
         timings,
@@ -101,7 +175,7 @@ pub fn execute_batch<'a>(
 pub fn execute_batch_until_commit<'a>(
     batch: &'a TransactionBatchWithIndexes<impl TransactionWithMeta>,
     bank: &'a Arc<Bank>,
-    record_transaction_status: bool,
+    transaction_status_sender: Option<&'a TransactionStatusSender>,
     replay_vote_sender: Option<&'a ReplayVoteSender>,
     replay_vote_send_type: ReplayVoteSendType,
     timings: &'a mut ExecuteTimings,
@@ -111,17 +185,45 @@ pub fn execute_batch_until_commit<'a>(
         batch,
         transaction_indexes,
     } = batch;
+    let record_transaction_status = transaction_status_sender.is_some();
+    let notify_before_commit =
+        transaction_status_sender.filter(|_| qn_flags::geyser_tx_notify_before_commit());
+    let mut status_sent = false;
 
-    crate::tx_exec_timing::exec_start(bank.slot(), transaction_indexes);
+    tx_exec_timing::exec_start(bank.slot(), transaction_indexes);
+    let timings_before = tx_exec_timing::enabled().then(|| svm_timings(timings));
 
-    let pre_commit_callback = |processing_results: &_| -> TransactionResult<()> {
+    let pre_commit_callback = |processing_results: &mut Vec<TransactionProcessingResult>,
+                               balance_collector: &mut Option<BalanceCollector>|
+     -> TransactionResult<()> {
         // We're entering into one of the block-verification methods.
-        get_first_error(batch, processing_results)
+        get_first_error(batch, processing_results.as_slice())?;
+        if let Some(transaction_status_sender) = notify_before_commit {
+            let timing_start = tx_exec_timing::part_start();
+            let commit_results = Bank::take_commit_results_before_commit(processing_results);
+            let costs = status_costs(get_transaction_costs(
+                bank,
+                &commit_results,
+                batch.sanitized_transactions(),
+            ));
+            send_transaction_status(
+                batch.sanitized_transactions(),
+                bank,
+                transaction_status_sender,
+                commit_results,
+                balance_collector.take(),
+                costs,
+                transaction_indexes.clone(),
+                timing_start,
+            );
+            status_sent = true;
+        }
+        Ok(())
     };
 
     let (commit_results, balance_collector) = batch
         .bank()
-        .load_execute_and_commit_transactions_with_pre_commit_callback(
+        .load_execute_and_commit_transactions_with_pre_commit_access(
             batch,
             ExecutionRecordingConfig::new_single_setting(record_transaction_status),
             timings,
@@ -130,7 +232,11 @@ pub fn execute_batch_until_commit<'a>(
         )?;
     slot_tail_timing::tx_committed(bank.slot());
     crate::shred_to_tx_timing::committed(bank.slot(), transaction_indexes);
-    crate::tx_exec_timing::committed(bank.slot(), transaction_indexes);
+    if let Some(timings_before) = timings_before {
+        record_svm_parts(timings_before, timings);
+    }
+    tx_exec_timing::committed(bank.slot(), transaction_indexes);
+    let timing_start = tx_exec_timing::part_start();
 
     let mut check_block_costs_elapsed = Measure::start("check_block_costs");
 
@@ -143,6 +249,12 @@ pub fn execute_batch_until_commit<'a>(
         ExecuteTimingType::CheckBlockLimitsUs,
         check_block_costs_elapsed.as_us(),
     );
+    let timing_start = tx_exec_timing::part_set(
+        bank.slot(),
+        transaction_indexes,
+        Part::CostTracker,
+        timing_start,
+    );
 
     checked_tx_costs_result?;
 
@@ -152,18 +264,18 @@ pub fn execute_batch_until_commit<'a>(
         replay_vote_sender,
         replay_vote_send_type,
     );
+    tx_exec_timing::part_set(
+        bank.slot(),
+        transaction_indexes,
+        Part::VoteSend,
+        timing_start,
+    );
 
     let (costs, transaction_indexes) = if record_transaction_status {
         // The length of costs vector needs to be consistent with all other
         // vectors that are sent over (such as `transactions`). So, replace the
         // None elements with Some(0)
-        (
-            tx_costs
-                .into_iter()
-                .map(|tx_cost_option| tx_cost_option.map(|tx_cost| tx_cost.sum()).or(Some(0)))
-                .collect(),
-            transaction_indexes.clone(),
-        )
+        (status_costs(tx_costs), transaction_indexes.clone())
     } else {
         (vec![], vec![])
     };
@@ -173,6 +285,7 @@ pub fn execute_batch_until_commit<'a>(
         balance_collector,
         costs,
         transaction_indexes,
+        status_sent,
     })
 }
 
@@ -188,8 +301,10 @@ pub fn finish_batch_after_commit(
         balance_collector,
         costs,
         transaction_indexes,
+        status_sent,
     } = post_commit;
 
+    let timing_start = tx_exec_timing::part_start();
     if let Some(prioritization_fee_cache) = prioritization_fee_cache {
         let fee_paying_transactions = commit_results
             .iter()
@@ -197,33 +312,24 @@ pub fn finish_batch_after_commit(
             .filter_map(|(commit_result, tx)| commit_result.was_fee_paying().then_some(tx));
         prioritization_fee_cache.update(bank, fee_paying_transactions);
     }
-    if let Some(transaction_status_sender) = transaction_status_sender {
-        let transactions: Vec<SanitizedTransaction> = transactions
-            .iter()
-            .map(|tx| tx.as_sanitized_transaction().into_owned())
-            .collect();
-
-        // There are two cases where balance_collector could be None:
-        // * Balance recording is disabled. If that were the case, there would
-        //   be no TransactionStatusSender, and we would not be in this branch.
-        // * The batch was aborted in its entirety in SVM. In that case, nothing
-        //   would have been committed.
-        // Therefore this should always be true.
-        debug_assert!(balance_collector.is_some());
-
-        let (balances, token_balances) =
-            compile_collected_balances(balance_collector.unwrap_or_default());
-
-        transaction_status_sender.send_transaction_status_batch(
-            bank.slot(),
-            bank.bank_id(),
+    let timing_start = tx_exec_timing::part_add(Part::PrioFee, timing_start);
+    let timed = (timing_start != 0).then(|| transaction_indexes.clone());
+    if let Some(transaction_status_sender) = transaction_status_sender
+        && !status_sent
+    {
+        send_transaction_status(
             transactions,
+            bank,
+            transaction_status_sender,
             commit_results,
-            balances,
-            token_balances,
+            balance_collector,
             costs,
             transaction_indexes,
+            timing_start,
         );
+    }
+    if let Some(transaction_indexes) = timed {
+        tx_exec_timing::post_commit_parts(bank.slot(), &transaction_indexes);
     }
 }
 

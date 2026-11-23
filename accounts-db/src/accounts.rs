@@ -524,6 +524,8 @@ impl Accounts {
         if accounts_db.has_accounts_update_notifier() {
             let notify_start =
                 (accounts.len() >= LARGE_STORE_NUM_ACCOUNTS).then(std::time::Instant::now);
+            let tracked_start =
+                crate::accounts_db::qn_load_tracking().then(std::time::Instant::now);
             let mut current_write_version = accounts_db
                 .write_version
                 .fetch_add(accounts.len() as u64, Ordering::AcqRel);
@@ -546,6 +548,11 @@ impl Accounts {
             if let Some(notify_start) = notify_start {
                 LARGE_STORE_GEYSER_NOTIFY_NS
                     .store(notify_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            if let Some(tracked_start) = tracked_start {
+                crate::accounts_db::qn_add_geyser_notify_ns(
+                    tracked_start.elapsed().as_nanos() as u64
+                );
             }
         }
 

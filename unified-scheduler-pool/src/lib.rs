@@ -728,7 +728,7 @@ impl TaskHandler for DefaultTaskHandler {
         let executed = execute_batch_until_commit(
             &batch_with_indexes,
             bank,
-            handler_context.transaction_status_sender.is_some(),
+            handler_context.transaction_status_sender.as_ref(),
             handler_context.replay_vote_sender.as_ref(),
             ReplayVoteSendType::Executed {
                 replay_bank_id: bank.bank_id(),

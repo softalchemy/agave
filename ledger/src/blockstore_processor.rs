@@ -1646,6 +1646,20 @@ fn confirm_slot_once(
     slot_tail_timing::mark(slot, Event::EntriesFetched);
     shred_to_tx_timing::fetched(slot, &completed_ranges);
     tx_exec_timing::fetched();
+    if qn_flags::replay_account_prefetch() {
+        solana_runtime::account_prefetch::spawn(
+            bank.clone_without_scheduler(),
+            slot_components
+                .iter()
+                .filter_map(|component| match component {
+                    ParsedBlockComponent::EntryBatch(entries) => Some(entries),
+                    ParsedBlockComponent::BlockMarker(_) => None,
+                })
+                .flatten()
+                .flat_map(|entry| entry.transactions.iter().cloned())
+                .collect(),
+        );
+    }
 
     // Process block components for Alpenglow slots. Note that we don't need to run migration checks
     // for BlockMarkers here, despite BlockMarkers only being active post-Alpenglow. Here's why:

@@ -5,6 +5,7 @@
 mod account_saver;
 #[cfg(feature = "dev-context-only-utils")]
 pub mod account_saver;
+pub mod account_prefetch;
 pub mod accounts_background_service;
 mod alpenglow_epoch_type;
 pub mod bank;
