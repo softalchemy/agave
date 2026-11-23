@@ -150,6 +150,10 @@ impl ShredFetchStage {
             ShredIngress::Repair(_) => REPAIR_FETCH_CHANNEL_SIZE,
         };
         let (packet_sender, packet_receiver) = EvictingSender::new_bounded(channel_size);
+        let coalesce_ms = std::env::var("AGAVE_SHRED_FETCH_COALESCE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
         let receiver_stats = Arc::new(StreamerReceiveStats::new(receiver_name));
         let streamers = sockets
             .into_iter()
@@ -161,7 +165,7 @@ impl ShredFetchStage {
                     exit.clone(),
                     packet_sender.clone(),
                     receiver_stats.clone(),
-                    Some(Duration::from_millis(5)), // coalesce
+                    Some(Duration::from_millis(coalesce_ms)), // coalesce
                     false,                          // is_staked_service
                 )
             })
